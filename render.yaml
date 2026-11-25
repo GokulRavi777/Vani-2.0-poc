@@ -31,12 +31,12 @@ services:
         value: gemini-2.5-flash-lite
 
   # 2. React Candidate Portal (100% Free Static Site)
-  - type: static_site
+  - type: web
     name: vani-frontend
+    runtime: static
     rootDir: frontend
     buildCommand: npm install && npm run build
-    publishDir: dist
-    pullRequestPreviewsEnabled: false
+    staticPublishPath: ./dist
     routes:
       - type: rewrite
         source: /*
