@@ -1,0 +1,49 @@
+services:
+  # 1. Unified Backend + LiveKit Agent (Free Web Service)
+  - type: web
+    name: vani-backend-agent
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    region: oregon
+    envVars:
+      - key: LIVEKIT_URL
+        sync: false
+      - key: LIVEKIT_API_KEY
+        sync: false
+      - key: LIVEKIT_API_SECRET
+        sync: false
+      - key: AGENT_NAME
+        value: vani-interviewer
+      - key: GNANI_API_KEY
+        sync: false
+      - key: GNANI_STT_LANGUAGE
+        value: en-IN
+      - key: GNANI_TTS_VOICE
+        value: Nalini
+      - key: GNANI_TTS_MODEL
+        value: timbre-v2.5
+      - key: GNANI_TTS_LANGUAGE
+        value: en-IN
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-2.5-flash-lite
+
+  # 2. React Candidate Portal (100% Free Static Site)
+  - type: static_site
+    name: vani-frontend
+    rootDir: frontend
+    buildCommand: npm install && npm run build
+    publishDir: dist
+    pullRequestPreviewsEnabled: false
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+    envVars:
+      - key: VITE_API_BASE_URL
+        fromService:
+          type: web
+          name: vani-backend-agent
+          property: host
