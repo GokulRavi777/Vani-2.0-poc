@@ -11,8 +11,8 @@ const ProtectedRoute: React.FC<{ children: React.ReactNode }> = ({ children }) =
   const { token, loading } = useAuth();
   if (loading) {
     return (
-      <div className="min-h-screen bg-slate-950 flex items-center justify-center text-white">
-        <span className="w-6 h-6 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin" />
+      <div className="min-h-screen bg-slate-50 flex items-center justify-center text-slate-900">
+        <span className="w-6 h-6 border-2 border-indigo-600 border-t-transparent rounded-full animate-spin" />
       </div>
     );
   }

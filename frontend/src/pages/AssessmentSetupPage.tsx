@@ -68,26 +68,26 @@ export const AssessmentSetupPage: React.FC = () => {
   const allChecksPassed = micPermission === 'granted' && audioPlaybackChecked;
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col justify-center items-center p-6">
-      <div className="max-w-2xl w-full bg-slate-900 border border-slate-800 rounded-2xl p-8 shadow-2xl">
+    <div className="min-h-screen bg-slate-50 text-slate-900 flex flex-col justify-center items-center p-6">
+      <div className="max-w-2xl w-full bg-white border border-slate-200 rounded-2xl p-8 shadow-xl shadow-slate-200/50">
         <div className="mb-6">
-          <div className="flex items-center gap-2 text-indigo-400 font-semibold text-xs tracking-wider uppercase mb-1">
+          <div className="flex items-center gap-2 text-indigo-600 font-semibold text-xs tracking-wider uppercase mb-1">
             <Radio className="w-4 h-4 animate-pulse" />
             <span>Pre-Flight Readiness Check</span>
           </div>
-          <h2 className="text-2xl font-bold text-white">Assessment Setup: {skill}</h2>
-          <p className="text-slate-400 text-sm mt-1">
+          <h2 className="text-2xl font-bold text-slate-900">Assessment Setup: {skill}</h2>
+          <p className="text-slate-500 text-sm mt-1">
             Please review the interview guidelines and verify your microphone and speakers before beginning.
           </p>
         </div>
 
         {/* Guidelines */}
-        <div className="bg-slate-800/50 border border-slate-700/60 rounded-xl p-5 mb-6 space-y-2 text-sm text-slate-300">
-          <h4 className="font-semibold text-white flex items-center gap-2 mb-2">
-            <ShieldCheck className="w-4 h-4 text-emerald-400" />
+        <div className="bg-slate-50 border border-slate-200 rounded-xl p-5 mb-6 space-y-2 text-sm text-slate-700">
+          <h4 className="font-semibold text-slate-900 flex items-center gap-2 mb-2">
+            <ShieldCheck className="w-4 h-4 text-emerald-600" />
             Interview Rules & Guidelines
           </h4>
-          <ul className="list-disc pl-5 space-y-1.5 text-xs text-slate-300">
+          <ul className="list-disc pl-5 space-y-1.5 text-xs text-slate-600">
             <li>The assessment consists of three foundational technical questions with brief follow-ups.</li>
             <li>You can speak naturally at any time; Vani supports pause, resume, and clarifying examples.</li>
             <li>Ensure you are in a quiet room with minimal background noise.</li>
@@ -98,20 +98,20 @@ export const AssessmentSetupPage: React.FC = () => {
         {/* Device Checks */}
         <div className="space-y-4 mb-8">
           {/* Mic Check */}
-          <div className="p-4 rounded-xl bg-slate-800/80 border border-slate-700 flex items-center justify-between">
+          <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 flex items-center justify-between">
             <div className="flex items-center gap-3">
               <div className={`p-2.5 rounded-lg border ${
                 micPermission === 'granted'
-                  ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400'
+                  ? 'bg-emerald-50 border-emerald-200 text-emerald-600'
                   : micPermission === 'denied'
-                  ? 'bg-red-500/10 border-red-500/30 text-red-400'
-                  : 'bg-slate-700/50 border-slate-600 text-slate-400'
+                  ? 'bg-red-50 border-red-200 text-red-600'
+                  : 'bg-slate-100 border-slate-200 text-slate-500'
               }`}>
                 <Mic className="w-5 h-5" />
               </div>
               <div>
-                <p className="font-medium text-white text-sm">Microphone Input</p>
-                <p className="text-xs text-slate-400">
+                <p className="font-medium text-slate-900 text-sm">Microphone Input</p>
+                <p className="text-xs text-slate-500">
                   {micPermission === 'granted'
                     ? 'Microphone active and authorized'
                     : micPermission === 'denied'
@@ -122,11 +122,11 @@ export const AssessmentSetupPage: React.FC = () => {
             </div>
 
             {micPermission === 'granted' ? (
-              <CheckCircle2 className="w-6 h-6 text-emerald-400" />
+              <CheckCircle2 className="w-6 h-6 text-emerald-600" />
             ) : (
               <button
                 onClick={requestMicPermission}
-                className="text-xs font-semibold px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg transition"
+                className="text-xs font-semibold px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg transition shadow-sm cursor-pointer"
               >
                 Verify Mic
               </button>
@@ -134,18 +134,18 @@ export const AssessmentSetupPage: React.FC = () => {
           </div>
 
           {/* Speaker / Audio Check */}
-          <div className="p-4 rounded-xl bg-slate-800/80 border border-slate-700 flex items-center justify-between">
+          <div className="p-4 rounded-xl bg-slate-50 border border-slate-200 flex items-center justify-between">
             <div className="flex items-center gap-3">
               <div className={`p-2.5 rounded-lg border ${
                 audioPlaybackChecked
-                  ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400'
-                  : 'bg-slate-700/50 border-slate-600 text-slate-400'
+                  ? 'bg-emerald-50 border-emerald-200 text-emerald-600'
+                  : 'bg-slate-100 border-slate-200 text-slate-500'
               }`}>
                 <Volume2 className="w-5 h-5" />
               </div>
               <div>
-                <p className="font-medium text-white text-sm">Audio Playback</p>
-                <p className="text-xs text-slate-400">
+                <p className="font-medium text-slate-900 text-sm">Audio Playback</p>
+                <p className="text-xs text-slate-500">
                   {audioPlaybackChecked
                     ? 'Audio output tested and verified'
                     : 'Test speaker output to ensure you can hear Vani'}
@@ -154,12 +154,12 @@ export const AssessmentSetupPage: React.FC = () => {
             </div>
 
             {audioPlaybackChecked ? (
-              <CheckCircle2 className="w-6 h-6 text-emerald-400" />
+              <CheckCircle2 className="w-6 h-6 text-emerald-600" />
             ) : (
               <button
                 onClick={testAudioPlayback}
                 disabled={audioTesting}
-                className="text-xs font-semibold px-4 py-2 bg-slate-700 hover:bg-slate-600 text-white rounded-lg transition flex items-center gap-1.5"
+                className="text-xs font-semibold px-4 py-2 bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 rounded-lg transition flex items-center gap-1.5 shadow-sm cursor-pointer"
               >
                 <Headphones className="w-3.5 h-3.5" />
                 {audioTesting ? 'Testing...' : 'Test Sound'}
@@ -172,7 +172,7 @@ export const AssessmentSetupPage: React.FC = () => {
         <div className="flex justify-between items-center pt-2">
           <button
             onClick={() => navigate('/skills')}
-            className="text-xs text-slate-400 hover:text-white transition"
+            className="text-xs text-slate-500 hover:text-slate-800 transition cursor-pointer"
           >
             ← Back to Domains
           </button>
@@ -180,7 +180,7 @@ export const AssessmentSetupPage: React.FC = () => {
           <button
             onClick={handleStartAssessment}
             disabled={!allChecksPassed || isStarting}
-            className="bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 text-white font-medium px-8 py-3 rounded-xl flex items-center gap-2 transition duration-200 shadow-lg shadow-emerald-600/20"
+            className="bg-emerald-600 hover:bg-emerald-700 disabled:opacity-40 text-white font-medium px-8 py-3 rounded-xl flex items-center gap-2 transition duration-200 shadow-lg shadow-emerald-600/20 cursor-pointer"
           >
             {isStarting ? (
               <span className="inline-block w-5 h-5 border-2 border-white/20 border-t-white rounded-full animate-spin" />

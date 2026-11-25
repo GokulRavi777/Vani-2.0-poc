@@ -38,20 +38,20 @@ export const SkillSelectionPage: React.FC = () => {
   };
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col">
+    <div className="min-h-screen bg-slate-50 text-slate-900 flex flex-col">
       {/* Header */}
-      <header className="border-b border-slate-800 bg-slate-900/50 backdrop-blur px-6 py-4 flex justify-between items-center">
+      <header className="border-b border-slate-200 bg-white/80 backdrop-blur px-6 py-4 flex justify-between items-center sticky top-0 z-10">
         <div className="flex items-center gap-3">
-          <div className="w-9 h-9 rounded-xl bg-indigo-600/20 border border-indigo-500/30 flex items-center justify-center">
-            <Code2 className="w-5 h-5 text-indigo-400" />
+          <div className="w-9 h-9 rounded-xl bg-indigo-50 border border-indigo-100 flex items-center justify-center">
+            <Code2 className="w-5 h-5 text-indigo-600" />
           </div>
-          <span className="font-semibold text-lg text-white">VANI 2.0</span>
+          <span className="font-semibold text-lg text-slate-900">VANI 2.0</span>
         </div>
         <div className="flex items-center gap-4">
-          <span className="text-sm text-slate-400">Candidate: <strong className="text-white">{candidate?.name}</strong></span>
+          <span className="text-sm text-slate-600">Candidate: <strong className="text-slate-900">{candidate?.name}</strong></span>
           <button
             onClick={logout}
-            className="text-slate-400 hover:text-white p-2 rounded-lg hover:bg-slate-800 transition"
+            className="text-slate-400 hover:text-slate-700 p-2 rounded-lg hover:bg-slate-100 transition cursor-pointer"
             title="Log out"
           >
             <LogOut className="w-4 h-4" />
@@ -62,8 +62,8 @@ export const SkillSelectionPage: React.FC = () => {
       {/* Main Container */}
       <main className="flex-1 max-w-4xl w-full mx-auto p-6 md:p-12 flex flex-col justify-center">
         <div className="mb-8">
-          <h2 className="text-3xl font-bold text-white tracking-tight">Select Assessment Domain</h2>
-          <p className="text-slate-400 mt-2">
+          <h2 className="text-3xl font-bold text-slate-900 tracking-tight">Select Assessment Domain</h2>
+          <p className="text-slate-600 mt-2">
             Please confirm your technical skill to begin your conversational voice interview.
           </p>
         </div>
@@ -76,33 +76,33 @@ export const SkillSelectionPage: React.FC = () => {
               <div
                 key={skill.id}
                 onClick={() => setSelectedSkill(skill.name)}
-                className={`p-6 rounded-2xl border transition-all cursor-pointer flex items-start justify-between ${
+                className={`p-6 rounded-2xl border transition-all cursor-pointer flex items-start justify-between shadow-sm ${
                   isSelected
-                    ? 'bg-indigo-600/10 border-indigo-500 ring-2 ring-indigo-500/20'
-                    : 'bg-slate-900 border-slate-800 hover:border-slate-700'
+                    ? 'bg-indigo-50/70 border-indigo-500 ring-2 ring-indigo-500/20 shadow-indigo-100/50'
+                    : 'bg-white border-slate-200 hover:border-slate-300 hover:shadow-md'
                 }`}
               >
                 <div className="flex items-start gap-4">
                   <div className={`p-3 rounded-xl border ${
                     isSelected
-                      ? 'bg-indigo-600/20 border-indigo-500/40 text-indigo-400'
-                      : 'bg-slate-800 border-slate-700 text-slate-400'
+                      ? 'bg-indigo-100/80 border-indigo-200 text-indigo-600'
+                      : 'bg-slate-100 border-slate-200 text-slate-500'
                   }`}>
                     <Code2 className="w-6 h-6" />
                   </div>
                   <div>
                     <div className="flex items-center gap-2">
-                      <h3 className="font-semibold text-lg text-white">{skill.name}</h3>
-                      <span className="text-xs px-2.5 py-0.5 rounded-full bg-slate-800 border border-slate-700 text-slate-300">
+                      <h3 className="font-semibold text-lg text-slate-900">{skill.name}</h3>
+                      <span className="text-xs px-2.5 py-0.5 rounded-full bg-slate-100 border border-slate-200 text-slate-700 font-medium">
                         {skill.category}
                       </span>
                     </div>
-                    <p className="text-slate-400 text-sm mt-1 max-w-xl">{skill.description}</p>
+                    <p className="text-slate-600 text-sm mt-1 max-w-xl">{skill.description}</p>
                   </div>
                 </div>
 
                 <div className="flex items-center pt-1">
-                  <CheckCircle2 className={`w-6 h-6 ${isSelected ? 'text-indigo-400' : 'text-slate-700'}`} />
+                  <CheckCircle2 className={`w-6 h-6 ${isSelected ? 'text-indigo-600' : 'text-slate-300'}`} />
                 </div>
               </div>
             );
@@ -114,7 +114,7 @@ export const SkillSelectionPage: React.FC = () => {
           <button
             onClick={handleContinue}
             disabled={!selectedSkill || isSubmitting}
-            className="bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white font-medium px-8 py-3 rounded-xl flex items-center gap-2 transition duration-200 shadow-lg shadow-indigo-600/25"
+            className="bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white font-medium px-8 py-3 rounded-xl flex items-center gap-2 transition duration-200 shadow-lg shadow-indigo-600/20 cursor-pointer"
           >
             {isSubmitting ? (
               <span className="inline-block w-5 h-5 border-2 border-white/20 border-t-white rounded-full animate-spin" />

@@ -8,6 +8,9 @@
 *.sqlite
 *.sqlite3
 
+# LangGraph Local Dev Cache
+.langgraph_api/
+
 # Python artifacts
 __pycache__/
 *.py[cod]
