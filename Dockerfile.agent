@@ -1,0 +1,39 @@
+# ==========================================
+# VANI 2.0 - LiveKit Voice Agent Container
+# ==========================================
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app
+
+WORKDIR /app
+
+# Install build dependencies required for audio/C extensions
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    g++ \
+    python3-dev \
+    libglib2.0-0 \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy source code and configurations
+COPY config ./config
+COPY vani ./vani
+COPY backend ./backend
+COPY agent.py ./
+
+# Pre-download LiveKit model weights (Silero VAD) at image build time
+RUN python -m livekit.agents download-files || true
+
+# Create data directory for shared SQLite DB
+RUN mkdir -p /app/data
+
+# Run LiveKit agent worker in production mode
+ENTRYPOINT ["python", "agent.py"]
+CMD ["start"]

@@ -1,0 +1,24 @@
+# LiveKit & Voice Agent Pipeline
+livekit>=0.18.0
+livekit-agents>=1.8.12
+livekit-plugins-silero>=1.8.12
+livekit-plugins-gnani>=1.8.12
+livekit-plugins-google>=1.8.12
+livekit-api>=0.8.0
+
+# LLM & LangGraph State Machine
+langchain-core>=0.3.0
+langchain-google-genai>=2.0.0
+langgraph>=0.2.0
+langchain-mcp-adapters>=0.1.0
+mcp<2
+
+# FastAPI Backend & Persistence
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+sqlalchemy>=2.0.0
+bcrypt>=4.0.0
+pyjwt>=2.8.0
+python-multipart>=0.0.12
+pydantic>=2.9.0
+python-dotenv>=1.0.0

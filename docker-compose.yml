@@ -1,0 +1,77 @@
+services:
+  # 1. FastAPI Application Backend
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: vani-backend
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=sqlite:////app/data/vani_platform.db
+      - LIVEKIT_URL=${LIVEKIT_URL}
+      - LIVEKIT_API_KEY=${LIVEKIT_API_KEY}
+      - LIVEKIT_API_SECRET=${LIVEKIT_API_SECRET}
+      - AGENT_NAME=${AGENT_NAME:-vani-interviewer}
+      - GNANI_API_KEY=${GNANI_API_KEY}
+      - GNANI_STT_LANGUAGE=${GNANI_STT_LANGUAGE:-en-IN}
+      - GNANI_TTS_VOICE=${GNANI_TTS_VOICE:-Nalini}
+      - GNANI_TTS_MODEL=${GNANI_TTS_MODEL:-timbre-v2.5}
+      - GNANI_TTS_LANGUAGE=${GNANI_TTS_LANGUAGE:-en-IN}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.5-flash-lite}
+    volumes:
+      - vani-data:/app/data
+    networks:
+      - vani-network
+
+  # 2. LiveKit Voice Agent Worker
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    container_name: vani-agent
+    restart: unless-stopped
+    depends_on:
+      - backend
+    environment:
+      - DATABASE_URL=sqlite:////app/data/vani_platform.db
+      - LIVEKIT_URL=${LIVEKIT_URL}
+      - LIVEKIT_API_KEY=${LIVEKIT_API_KEY}
+      - LIVEKIT_API_SECRET=${LIVEKIT_API_SECRET}
+      - AGENT_NAME=${AGENT_NAME:-vani-interviewer}
+      - GNANI_API_KEY=${GNANI_API_KEY}
+      - GNANI_STT_LANGUAGE=${GNANI_STT_LANGUAGE:-en-IN}
+      - GNANI_STT_USE_STREAMING=${GNANI_STT_USE_STREAMING:-false}
+      - GNANI_TTS_VOICE=${GNANI_TTS_VOICE:-Nalini}
+      - GNANI_TTS_MODEL=${GNANI_TTS_MODEL:-timbre-v2.5}
+      - GNANI_TTS_LANGUAGE=${GNANI_TTS_LANGUAGE:-en-IN}
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - GEMINI_MODEL=${GEMINI_MODEL:-gemini-2.5-flash-lite}
+    volumes:
+      - vani-data:/app/data
+    networks:
+      - vani-network
+
+  # 3. React Frontend Client (NGINX Reverse Proxy)
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: vani-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "3000:80"
+    networks:
+      - vani-network
+
+volumes:
+  vani-data:
+    driver: local
+
+networks:
+  vani-network:
+    driver: bridge

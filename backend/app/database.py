@@ -2,10 +2,11 @@
 Database setup and SQLAlchemy base for VANI 2.0 Application Backend.
 """
 
+import os
 from sqlalchemy import create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 
-DATABASE_URL = "sqlite:///./vani_platform.db"
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./vani_platform.db")
 
 engine = create_engine(
     DATABASE_URL,
