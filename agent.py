@@ -39,8 +39,11 @@ class VaniInterviewAgent(Agent):
         self.session.generate_reply()
 
 
-# Initialize LiveKit Agent Server
-server = AgentServer()
+# Initialize LiveKit Agent Server with 0 idle processes to fit within Render Free Tier (512 MB RAM)
+server = AgentServer(
+    num_idle_processes=0,
+    initialize_process_timeout=60.0,
+)
 
 @server.rtc_session(agent_name=settings.AGENT_NAME)
 async def entrypoint(ctx: JobContext) -> None:
