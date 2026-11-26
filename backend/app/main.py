@@ -48,6 +48,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.get("/")
+@app.head("/")
+def health_check():
+    """Root health check for Render and load balancers."""
+    return {"status": "ok", "service": "VANI 2.0 Interview Platform"}
+
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 
 
