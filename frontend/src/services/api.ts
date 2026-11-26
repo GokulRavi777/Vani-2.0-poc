@@ -8,7 +8,7 @@ if (rawBase.endsWith('/')) {
   rawBase = rawBase.slice(0, -1);
 }
 
-const API_BASE = rawBase || (typeof window !== 'undefined' && window.location.port === '5173' ? 'http://localhost:8000' : '');
+export const API_BASE = rawBase || (typeof window !== 'undefined' && window.location.port === '5173' ? 'http://localhost:8000' : '');
 
 const api = axios.create({
   baseURL: API_BASE,

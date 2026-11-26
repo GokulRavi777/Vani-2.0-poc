@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import { Bot, Lock, Mail, ArrowRight, AlertCircle } from 'lucide-react';
+import { API_BASE } from '../services/api';
 
 export const LoginPage: React.FC = () => {
   const [email, setEmail] = useState('candidate@vani.ai');
@@ -19,7 +20,13 @@ export const LoginPage: React.FC = () => {
       await login(email, password);
       navigate('/skills');
     } catch (err: any) {
-      setError(err.response?.data?.detail || 'Invalid email or password. Please try again.');
+      const detail = err.response?.data?.detail;
+      if (detail) {
+        setError(detail);
+      } else {
+        const status = err.response?.status ? `HTTP ${err.response.status}` : 'Network/CORS Error';
+        setError(`Cannot reach backend (${status}) at "${API_BASE || 'same-origin'}". ${err.message || ''}`);
+      }
     } finally {
       setIsLoading(false);
     }
