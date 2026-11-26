@@ -1,6 +1,14 @@
 import axios from 'axios';
 
-const API_BASE = import.meta.env.VITE_API_BASE_URL || (typeof window !== 'undefined' && window.location.port === '5173' ? 'http://localhost:8000' : '');
+let rawBase = (import.meta.env.VITE_API_BASE_URL || '').trim();
+if (rawBase && !rawBase.startsWith('http://') && !rawBase.startsWith('https://')) {
+  rawBase = `https://${rawBase}`;
+}
+if (rawBase.endsWith('/')) {
+  rawBase = rawBase.slice(0, -1);
+}
+
+const API_BASE = rawBase || (typeof window !== 'undefined' && window.location.port === '5173' ? 'http://localhost:8000' : '');
 
 const api = axios.create({
   baseURL: API_BASE,
