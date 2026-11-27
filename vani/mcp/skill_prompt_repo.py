@@ -430,9 +430,10 @@ def ensure_skill_prompts_seeded(db: Optional[Session] = None) -> int:
             sess.close()
 
 
-def list_skills_from_db(db: Optional[Session] = None) -> List[Dict[str, Any]]:
-    """Lists all active mother skills with their nested sub-skills and topics."""
+def list_skills_from_db(db: Optional[Session] = None, query: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Lists active mother skills and nested sub-skills from DB, optionally filtered by a search query."""
     ensure_skill_prompts_seeded(db)
+    q_clean = query.strip().lower() if query and query.strip() else None
     own_session = db is None
     sess = db or SessionLocal()
     try:
@@ -444,9 +445,25 @@ def list_skills_from_db(db: Optional[Session] = None) -> List[Dict[str, Any]]:
         )
         results: List[Dict[str, Any]] = []
         for m in mothers:
-            active_subs = [s for s in m.sub_skills if s.is_active]
+            active_subs = sorted([s for s in m.sub_skills if s.is_active], key=lambda s: s.id)
+            if q_clean:
+                mother_matches = q_clean in m.name.lower() or q_clean in (m.description or "").lower()
+                matching_subs = [
+                    s for s in active_subs
+                    if (
+                        q_clean in s.name.lower()
+                        or q_clean in (s.description or "").lower()
+                        or q_clean in (s.topics_json or "").lower()
+                    )
+                ]
+                if not mother_matches and not matching_subs:
+                    continue
+                chosen_subs = active_subs if mother_matches and not matching_subs else matching_subs
+            else:
+                chosen_subs = active_subs
+
             all_topics: List[str] = []
-            for s in active_subs:
+            for s in chosen_subs:
                 for t in json.loads(s.topics_json or "[]"):
                     if t not in all_topics:
                         all_topics.append(t)
@@ -454,7 +471,7 @@ def list_skills_from_db(db: Optional[Session] = None) -> List[Dict[str, Any]]:
                 "id": m.id,
                 "skill_name": m.name,
                 "description": m.description,
-                "sub_skills": [_serialize_sub_skill(s, m.name) for s in active_subs],
+                "sub_skills": [_serialize_sub_skill(s, m.name) for s in chosen_subs],
                 "topics": all_topics,
             })
         return results

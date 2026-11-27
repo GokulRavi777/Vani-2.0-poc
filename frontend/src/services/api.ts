@@ -37,8 +37,10 @@ export const authService = {
 };
 
 export const assessmentService = {
-  getSkills: async () => {
-    const res = await api.get('/api/skills');
+  getSkills: async (query?: string) => {
+    const res = await api.get('/api/skills', {
+      params: query && query.trim() ? { q: query.trim() } : undefined,
+    });
     return res.data.skills;
   },
   createSession: async (skill: string = 'Python', subSkill?: string | null) => {

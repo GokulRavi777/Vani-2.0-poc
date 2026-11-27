@@ -159,8 +159,8 @@ def _split_skill_label(raw_skill: str) -> tuple[str, Optional[str]]:
 
 
 @app.get("/api/skills", response_model=SkillsResponse)
-def get_available_skills(db: Session = Depends(get_db)):
-    db_skills = list_skills_from_db(db=db)
+def get_available_skills(q: Optional[str] = None, db: Session = Depends(get_db)):
+    db_skills = list_skills_from_db(db=db, query=q)
     items: list[SkillItem] = []
     for m in db_skills:
         sub_items = [

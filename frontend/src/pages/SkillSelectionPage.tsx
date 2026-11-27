@@ -3,10 +3,12 @@ import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import { assessmentService } from '../services/api';
 import { SkillItem } from '../types';
-import { Code2, CheckCircle2, ArrowRight, LogOut, ChevronDown, ChevronRight, Layers } from 'lucide-react';
+import { Code2, CheckCircle2, ArrowRight, LogOut, ChevronDown, ChevronRight, Layers, Search, X } from 'lucide-react';
 
 export const SkillSelectionPage: React.FC = () => {
   const [skills, setSkills] = useState<SkillItem[]>([]);
+  const [searchQuery, setSearchQuery] = useState<string>('');
+  const [isSearching, setIsSearching] = useState<boolean>(false);
   const [expandedMother, setExpandedMother] = useState<string>('Python');
   const [selectedSkill, setSelectedSkill] = useState<string>('Python');
   const [selectedSubSkill, setSelectedSubSkill] = useState<string | null>('Python Core');
@@ -16,12 +18,18 @@ export const SkillSelectionPage: React.FC = () => {
   const navigate = useNavigate();
 
   useEffect(() => {
-    const loadSkills = async () => {
+    const timer = setTimeout(async () => {
+      setIsSearching(true);
       try {
-        const data: SkillItem[] = await assessmentService.getSkills();
+        const data: SkillItem[] = await assessmentService.getSkills(searchQuery);
         setSkills(data);
-        const defaultMother = data.find((s) => s.name === 'Python') || data[0];
-        if (defaultMother) {
+        setError(null);
+        if (searchQuery.trim() && data.length > 0) {
+          setExpandedMother(data[0].name);
+          setSelectedSkill(data[0].name);
+          setSelectedSubSkill(data[0].sub_skills?.[0]?.name || null);
+        } else if (!searchQuery.trim() && data.length > 0 && !data.some((s) => s.name === selectedSkill)) {
+          const defaultMother = data.find((s) => s.name === 'Python') || data[0];
           setExpandedMother(defaultMother.name);
           setSelectedSkill(defaultMother.name);
           setSelectedSubSkill(defaultMother.sub_skills?.[0]?.name || null);
@@ -29,10 +37,13 @@ export const SkillSelectionPage: React.FC = () => {
       } catch (err) {
         console.error('Error fetching skills:', err);
         setError('Failed to load skills from server.');
+      } finally {
+        setIsSearching(false);
       }
-    };
-    loadSkills();
-  }, []);
+    }, 200);
+
+    return () => clearTimeout(timer);
+  }, [searchQuery]);
 
   const handleToggleMother = (mother: SkillItem) => {
     const isAlreadyExpanded = expandedMother === mother.name;
@@ -94,11 +105,33 @@ export const SkillSelectionPage: React.FC = () => {
 
       {/* Main Container */}
       <main className="flex-1 max-w-4xl w-full mx-auto p-6 md:p-12 flex flex-col justify-center">
-        <div className="mb-8">
+        <div className="mb-6">
           <h2 className="text-3xl font-bold text-slate-900 tracking-tight">Select Assessment Domain</h2>
           <p className="text-slate-600 mt-2">
-            Choose a mother skill to expand its specializations, then select the exact skill for your voice interview.
+            Choose a mother skill to expand its specializations, or search by skill or topic from the database.
           </p>
+        </div>
+
+        {/* Search Bar */}
+        <div className="relative mb-6">
+          <Search className="w-5 h-5 text-slate-400 absolute left-4 top-3.5" />
+          <input
+            type="text"
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            placeholder="Search skills, specializations, or topics (e.g. Machine Learning, Pandas, SQL, Docker)..."
+            className="w-full bg-white border border-slate-200 rounded-xl pl-12 pr-11 py-3 text-sm text-slate-900 placeholder-slate-400 shadow-sm focus:outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/20 transition"
+          />
+          {searchQuery && (
+            <button
+              type="button"
+              onClick={() => setSearchQuery('')}
+              className="absolute right-3.5 top-3 text-slate-400 hover:text-slate-600 p-0.5 rounded-md cursor-pointer"
+              title="Clear search"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          )}
         </div>
 
         {error && (
@@ -109,6 +142,22 @@ export const SkillSelectionPage: React.FC = () => {
 
         {/* Mother Skill -> Sub-Skill Tree */}
         <div className="space-y-4 mb-8">
+          {!isSearching && skills.length === 0 && (
+            <div className="p-8 rounded-2xl border border-slate-200 bg-white text-center">
+              <p className="text-slate-600 text-sm">
+                No skills found matching <strong>"{searchQuery}"</strong>.
+              </p>
+              {searchQuery && (
+                <button
+                  type="button"
+                  onClick={() => setSearchQuery('')}
+                  className="mt-3 text-xs font-semibold text-indigo-600 hover:text-indigo-700 cursor-pointer"
+                >
+                  Clear search
+                </button>
+              )}
+            </div>
+          )}
           {skills.map((mother) => {
             const isExpanded = expandedMother === mother.name;
             const isMotherActive = selectedSkill === mother.name;
