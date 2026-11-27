@@ -18,7 +18,7 @@ from backend.app.database import engine, Base, get_db
 from backend.app.models import Candidate, InterviewSession
 from backend.app.schemas import (
     LoginRequest, LoginResponse, CandidateResponse,
-    SkillsResponse, SkillItem, CreateSessionRequest,
+    SkillsResponse, SkillItem, SubSkillItem, CreateSessionRequest,
     StartSessionResponse, SessionStatusResponse,
     CompleteSessionRequest, AssessmentResultResponse,
 )
@@ -26,6 +26,11 @@ from backend.app.auth import (
     hash_password, verify_password, create_access_token, decode_access_token
 )
 from backend.app.livekit_service import livekit_service
+from vani.mcp.skill_prompt_repo import (
+    ensure_skill_prompts_seeded,
+    get_skill_prompt_from_db,
+    list_skills_from_db,
+)
 from vani.session.manager import session_manager
 
 logger = logging.getLogger("vani.backend.main")
@@ -144,21 +149,41 @@ def get_me(candidate: Candidate = Depends(get_current_candidate)):
 
 
 # -------------------------------------------------------------
-# Skills Endpoint (Python Only for Demo Scope)
+# Skills Endpoint (DB-Backed MotherSkill -> SubSkill Tree)
 # -------------------------------------------------------------
+def _split_skill_label(raw_skill: str) -> tuple[str, Optional[str]]:
+    if "::" in raw_skill:
+        mother, sub = raw_skill.split("::", 1)
+        return mother.strip(), sub.strip() or None
+    return raw_skill.strip(), None
+
+
 @app.get("/api/skills", response_model=SkillsResponse)
-def get_available_skills():
-    return SkillsResponse(
-        skills=[
-            SkillItem(
-                id="python",
-                name="Python",
-                category="Programming Languages",
-                description="Foundational Python fundamentals: data structures, scoping, error handling, and memory models.",
-                available=True,
+def get_available_skills(db: Session = Depends(get_db)):
+    db_skills = list_skills_from_db(db=db)
+    items: list[SkillItem] = []
+    for m in db_skills:
+        sub_items = [
+            SubSkillItem(
+                id=sub["id"],
+                name=sub["sub_skill"],
+                description=sub["description"],
+                topics=sub["topics"],
+                difficulty_levels=sub["difficulty_levels"],
             )
+            for sub in m["sub_skills"]
         ]
-    )
+        items.append(
+            SkillItem(
+                id=str(m["id"]),
+                name=m["skill_name"],
+                category="Mother Skill",
+                description=m["description"],
+                available=True,
+                sub_skills=sub_items,
+            )
+        )
+    return SkillsResponse(skills=items)
 
 
 # -------------------------------------------------------------
@@ -170,22 +195,37 @@ def create_session(
     candidate: Candidate = Depends(get_current_candidate),
     db: Session = Depends(get_db),
 ):
-    if req.skill != "Python":
-        raise HTTPException(status_code=400, detail="Only Python skill is supported for this assessment.")
+    mother_name, parsed_sub = _split_skill_label(req.skill)
+    requested_sub = req.sub_skill or parsed_sub
+    record = get_skill_prompt_from_db(mother_name, sub_skill_name=requested_sub, db=db)
+    if not record:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Skill '{req.skill}' (sub_skill='{requested_sub}') is not configured in the database.",
+        )
 
+    stored_label = (
+        f"{record['mother_skill']} :: {record['sub_skill']}"
+        if requested_sub
+        else record["mother_skill"]
+    )
     session_id = f"vani_session_{uuid.uuid4().hex[:12]}"
     room_name = session_id  # Session ID matches room name for 1:1 isolation
 
     sess = InterviewSession(
         id=session_id,
         candidate_id=candidate.id,
-        selected_skill="Python",
+        selected_skill=stored_label,
         room_name=room_name,
         session_status="CREATED",
     )
     db.add(sess)
     db.commit()
     db.refresh(sess)
+
+    agent_sess = session_manager.get_or_create(room_name)
+    agent_sess.selected_skill = record["mother_skill"]
+    agent_sess.selected_sub_skill = record["sub_skill"] if requested_sub else None
     return sess
 
 
@@ -212,17 +252,23 @@ async def start_session(
         sess.started_at = datetime.utcnow()
     db.commit()
 
+    mother_skill, sub_skill = _split_skill_label(sess.selected_skill)
+    agent_sess = session_manager.get_or_create(sess.room_name)
+    agent_sess.selected_skill = mother_skill
+    agent_sess.selected_sub_skill = sub_skill
+    room_meta = {"session_id": sess.id, "skill": mother_skill, "sub_skill": sub_skill}
+
     # Generate candidate LiveKit Token
     token = livekit_service.generate_candidate_token(
         room_name=sess.room_name,
         participant_identity=f"candidate_{candidate.id[:8]}",
         participant_name=candidate.name,
-        metadata={"session_id": sess.id, "skill": "Python"},
+        metadata=room_meta,
     )
 
     # Dispatch VANI agent to room only on initial session creation
     if not already_dispatched:
-        await livekit_service.dispatch_agent(sess.room_name)
+        await livekit_service.dispatch_agent(sess.room_name, metadata=room_meta)
 
     return StartSessionResponse(
         session_id=sess.id,

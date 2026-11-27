@@ -1,9 +1,19 @@
 import json
+import logging
+import uuid
 from typing import Dict, List, Any, Optional
 from mcp.server.fastmcp import FastMCP
 from vani.schemas.models import SkillInfo, Question
 from vani.session.manager import session_manager
+from vani.mcp.skill_prompt_repo import (
+    list_skills_from_db,
+    get_skill_prompt_from_db,
+)
+from vani.llm.model import model_service
+from vani.llm.question_generator import QuestionValidator
 from config.settings import settings
+
+logger = logging.getLogger("vani.mcp.server")
 
 # In-memory curated skills repository
 SKILLS_CATALOG: Dict[str, SkillInfo] = {
@@ -255,121 +265,268 @@ mcp_server = FastMCP("Vani Interview MCP Server")
 
 @mcp_server.tool()
 def list_available_skills() -> Dict[str, Any]:
-    """Returns the list of supported technical skills with descriptions."""
+    """Returns the list of supported mother skills and their sub-skills from the database."""
+    db_skills = list_skills_from_db()
     skills = [
-        {"name": s.name, "description": s.description, "topics": s.topics}
-        for s in SKILLS_CATALOG.values()
+        {
+            "name": s["skill_name"],
+            "description": s["description"],
+            "sub_skills": [sub["sub_skill"] for sub in s["sub_skills"]],
+            "topics": s["topics"],
+        }
+        for s in db_skills
     ]
     return {
         "status": "success",
         "count": len(skills),
-        "skills": skills
+        "skills": skills,
     }
+
 
 @mcp_server.tool()
 def get_skill_details(skill: str) -> Dict[str, Any]:
-    """Returns details, topics, and difficulty levels for a specific technical skill.
-    
-    Args:
-        skill: Name of the technical skill (e.g., Python, Java, React).
-    """
-    skill_clean = skill.strip()
-    matched = next((k for k in SKILLS_CATALOG if k.lower() == skill_clean.lower()), None)
-    if not matched:
+    """Returns details, sub-skills, topics, and difficulty levels for a technical skill from the database."""
+    db_skills = list_skills_from_db()
+    matched_mother = next((m for m in db_skills if m["skill_name"].lower() == skill.strip().lower()), None)
+    if matched_mother:
+        diffs: List[str] = []
+        for sub in matched_mother["sub_skills"]:
+            for d in sub["difficulty_levels"]:
+                if d not in diffs:
+                    diffs.append(d)
+        return {
+            "status": "success",
+            "skill": matched_mother["skill_name"],
+            "description": matched_mother["description"],
+            "sub_skills": [sub["sub_skill"] for sub in matched_mother["sub_skills"]],
+            "topics": matched_mother["topics"],
+            "difficulty_levels": diffs,
+        }
+
+    record = get_skill_prompt_from_db(skill)
+    if not record:
+        supported = [s["skill_name"] for s in db_skills]
         return {
             "status": "error",
-            "message": f"Skill '{skill}' is not supported. Supported skills are: {', '.join(SKILLS_CATALOG.keys())}"
+            "message": f"Skill '{skill}' is not supported. Supported skills are: {', '.join(supported)}",
         }
-    info = SKILLS_CATALOG[matched]
     return {
         "status": "success",
-        "skill": info.name,
-        "description": info.description,
-        "topics": info.topics,
-        "difficulty_levels": info.difficulty_levels
+        "skill": record["mother_skill"],
+        "sub_skill": record["sub_skill"],
+        "description": record["description"],
+        "topics": record["topics"],
+        "difficulty_levels": record["difficulty_levels"],
     }
+
+
+@mcp_server.tool()
+def get_skill_few_shot_prompt(skill: str, sub_skill: Optional[str] = None) -> Dict[str, Any]:
+    """Fetches the system prompt and few-shot question generation prompt for a skill/sub-skill from DB."""
+    record = get_skill_prompt_from_db(skill, sub_skill_name=sub_skill)
+    if not record:
+        supported = [s["skill_name"] for s in list_skills_from_db()]
+        return {
+            "status": "error",
+            "message": f"Skill '{skill}' (sub_skill='{sub_skill}') not found in DB. Supported skills: {', '.join(supported)}",
+        }
+    return {
+        "status": "success",
+        "skill": record["mother_skill"],
+        "sub_skill": record["sub_skill"],
+        "topics": record["topics"],
+        "difficulty_levels": record["difficulty_levels"],
+        "system_prompt": record["system_prompt"],
+        "few_shot_prompt": record["few_shot_prompt"],
+    }
+
 
 @mcp_server.tool()
 def select_interview_skill(session_id: str, skill: str) -> Dict[str, Any]:
-    """Sets or switches the active technical interview skill for the current session.
-    
-    Args:
-        session_id: Active session identifier.
-        skill: Selected technical skill name.
-    """
-    skill_clean = skill.strip()
-    matched = next((k for k in SKILLS_CATALOG if k.lower() == skill_clean.lower()), None)
-    if not matched:
+    """Sets or switches the active technical interview skill for the current session."""
+    record = get_skill_prompt_from_db(skill)
+    if not record:
+        supported = [s["skill_name"] for s in list_skills_from_db()]
         return {
             "status": "error",
-            "message": f"Cannot select '{skill}'. Supported skills: {', '.join(SKILLS_CATALOG.keys())}"
+            "message": f"Cannot select '{skill}'. Supported skills: {', '.join(supported)}",
         }
-    
+
+    matched = record["skill_name"]
     session = session_manager.get_or_create(session_id)
     session.selected_skill = matched
     return {
         "status": "success",
         "session_id": session_id,
         "selected_skill": matched,
-        "message": f"Skill successfully set to {matched}."
+        "message": f"Skill successfully set to {matched}.",
     }
 
+
+def _prepare_prompt_inputs(
+    session: Any,
+    target_skill: str,
+    sub_skill: Optional[str] = None,
+) -> tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """Validates session limits and fetches the sub-skill's DB prompt + next topic."""
+    if not session.can_ask_primary_question():
+        return None, {
+            "status": "limit_reached",
+            "message": f"Primary question limit of {session.max_primary_questions} reached for this interview.",
+            "primary_question_count": session.primary_question_count,
+        }
+
+    record = get_skill_prompt_from_db(
+        target_skill,
+        sub_skill_name=sub_skill,
+        sub_skill_index=session.primary_question_count,
+    )
+    if not record:
+        return None, {
+            "status": "error",
+            "message": f"No prompt configuration found in DB for skill '{target_skill}' (sub_skill='{sub_skill}').",
+        }
+
+    topics = record["topics"] or [record["sub_skill"]]
+    topic = topics[session.primary_question_count % len(topics)]
+    difficulty_levels = record["difficulty_levels"] or ["Intermediate"]
+    difficulty = difficulty_levels[min(session.primary_question_count, len(difficulty_levels) - 1)]
+
+    prior_texts = [
+        q_info.get("question_text", q_id)
+        for q_id, q_info in session.question_state.items()
+    ] or session.presented_questions
+
+    formatted_prompt = record["few_shot_prompt"].format(
+        skill=record["mother_skill"],
+        sub_skill=record["sub_skill"],
+        topic=topic,
+        difficulty=difficulty,
+        previously_asked_questions=prior_texts or "None",
+        concepts_explored=session.concepts_mentioned or "None",
+        remaining_primary_allowance=session.max_primary_questions - session.primary_question_count,
+    )
+    return {
+        "record": record,
+        "topic": topic,
+        "difficulty": difficulty,
+        "prior_texts": prior_texts,
+        "formatted_prompt": formatted_prompt,
+    }, None
+
+
+def _finalize_generated_question(
+    session: Any,
+    ctx: Dict[str, Any],
+    llm_result: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Validates LLM-generated question or falls back cleanly to curated catalog."""
+    record = ctx["record"]
+    skill_name = record["skill_name"]
+    topic = ctx["topic"]
+    difficulty = ctx["difficulty"]
+    prior_texts = ctx["prior_texts"]
+
+    raw_q = QuestionValidator.clean_for_speech(llm_result.get("question_text", ""))
+    is_valid, reason = QuestionValidator.validate_question(
+        raw_q,
+        skill=skill_name,
+        presented_questions=prior_texts,
+        max_words=settings.MAX_SPOKEN_RESPONSE_WORDS,
+    )
+
+    if is_valid and not llm_result.get("error"):
+        q_id = f"{skill_name.lower()}_dyn_{uuid.uuid4().hex[:8]}"
+        expected = llm_result.get("expected_concepts") or [topic]
+        return {
+            "status": "success",
+            "source": "db_prompt_llm",
+            "question": {
+                "id": q_id,
+                "skill": skill_name,
+                "topic": llm_result.get("topic") or topic,
+                "subtopic": llm_result.get("subtopic") or topic,
+                "difficulty": llm_result.get("difficulty") or difficulty,
+                "question_text": raw_q,
+                "expected_concepts": expected,
+                "question_type": llm_result.get("question_type") or "conceptual",
+            },
+            "remaining_primary_allowance": session.max_primary_questions - session.primary_question_count,
+        }
+
+    logger.warning("Dynamic DB-prompt question fallback for %s (%s): %s", skill_name, topic, reason or llm_result.get("error"))
+    available = [
+        q for q in QUESTIONS_CATALOG
+        if q.skill.lower() == skill_name.lower() and q.id not in session.presented_questions
+    ] or [q for q in QUESTIONS_CATALOG if q.skill.lower() == skill_name.lower()]
+
+    if available:
+        selected = available[0]
+        return {
+            "status": "success",
+            "source": "catalog_fallback",
+            "question": {
+                "id": selected.id,
+                "skill": selected.skill,
+                "topic": selected.topic,
+                "subtopic": selected.subtopic,
+                "difficulty": selected.difficulty,
+                "question_text": selected.question_text,
+                "expected_concepts": selected.expected_concepts,
+                "question_type": selected.question_type,
+            },
+            "remaining_primary_allowance": session.max_primary_questions - session.primary_question_count,
+        }
+
+    return {
+        "status": "error",
+        "message": f"Unable to generate or retrieve a question for skill '{skill_name}'.",
+    }
+
+
 @mcp_server.tool()
-def get_next_question(session_id: str, skill: Optional[str] = None) -> Dict[str, Any]:
-    """Retrieves a suitable primary technical question for the active session, avoiding duplicates.
-    
-    Args:
-        session_id: Active session identifier.
-        skill: Optional skill name. If omitted, uses the session's selected skill.
-    """
+def get_next_question(session_id: str, skill: Optional[str] = None, sub_skill: Optional[str] = None) -> Dict[str, Any]:
+    """Fetches the sub-skill's few-shot prompt from DB and generates a dynamic question via LLM."""
     session = session_manager.get_or_create(session_id)
     target_skill = skill or session.selected_skill
+    target_sub_skill = sub_skill or session.selected_sub_skill
     if not target_skill:
         return {
             "status": "error",
-            "message": "No skill selected for this session. Please select a skill first."
+            "message": "No skill selected for this session. Please select a skill first.",
         }
-    
-    # Enforce 3 primary questions limit deterministically
-    if not session.can_ask_primary_question():
-        return {
-            "status": "limit_reached",
-            "message": f"Primary question limit of {session.max_primary_questions} reached for this interview.",
-            "primary_question_count": session.primary_question_count
-        }
-    
-    # Filter questions for this skill that haven't been presented yet
-    available = [
-        q for q in QUESTIONS_CATALOG
-        if q.skill.lower() == target_skill.lower() and q.id not in session.presented_questions
-    ]
-    
-    if not available:
-        # Fallback to any remaining question in the catalog for this skill
-        available = [q for q in QUESTIONS_CATALOG if q.skill.lower() == target_skill.lower()]
-    
-    if not available:
+
+    ctx, err = _prepare_prompt_inputs(session, target_skill, sub_skill=target_sub_skill)
+    if err:
+        return err
+
+    llm_result = model_service.invoke_json_sync(
+        ctx["formatted_prompt"],
+        system_prompt=ctx["record"]["system_prompt"],
+    )
+    return _finalize_generated_question(session, ctx, llm_result)
+
+
+async def aget_next_question(session_id: str, skill: Optional[str] = None, sub_skill: Optional[str] = None) -> Dict[str, Any]:
+    """Async version: fetches the sub-skill's few-shot prompt from DB and generates a dynamic question via LLM."""
+    session = session_manager.get_or_create(session_id)
+    target_skill = skill or session.selected_skill
+    target_sub_skill = sub_skill or session.selected_sub_skill
+    if not target_skill:
         return {
             "status": "error",
-            "message": f"No questions found for skill '{target_skill}'."
+            "message": "No skill selected for this session. Please select a skill first.",
         }
-    
-    # Select question
-    selected = available[0]
-    return {
-        "status": "success",
-        "question": {
-            "id": selected.id,
-            "skill": selected.skill,
-            "topic": selected.topic,
-            "subtopic": selected.subtopic,
-            "difficulty": selected.difficulty,
-            "question_text": selected.question_text,
-            "expected_concepts": selected.expected_concepts,
-            "question_type": selected.question_type
-        },
-        "remaining_primary_allowance": session.max_primary_questions - session.primary_question_count
-    }
+
+    ctx, err = _prepare_prompt_inputs(session, target_skill, sub_skill=target_sub_skill)
+    if err:
+        return err
+
+    llm_result = await model_service.invoke_json(
+        ctx["formatted_prompt"],
+        system_prompt=ctx["record"]["system_prompt"],
+    )
+    return _finalize_generated_question(session, ctx, llm_result)
 
 @mcp_server.tool()
 def save_interview_response(session_id: str, question_id: str, answer_text: str, concepts_identified: Optional[List[str]] = None, missing_concepts: Optional[List[str]] = None) -> Dict[str, Any]:

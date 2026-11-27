@@ -1,5 +1,6 @@
+import asyncio
 import logging
-from typing import Dict, Any, Literal
+from typing import Dict, Any, Optional
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
 from vani.graph.state import InterviewState
@@ -7,7 +8,6 @@ from vani.graph.nodes import (
     greeting_node,
     readiness_node,
     clarification_node,
-    skill_selection_node,
     question_delivery_node,
     answer_processing_node,
     repeat_node,
@@ -82,48 +82,53 @@ def route_dispatch(state: InterviewState) -> str:
         return "greeting"
     elif curr in ["GREETING", "READINESS_CHECK", "INITIALIZATION", "AWAITING_CANDIDATE", "PREPARATION_WAIT", "READINESS_CONFIRMATION"]:
         return "readiness"
-    elif curr == "SKILL_SELECTION" or not state.get("selected_skill"):
-        return "skill_selection"
 
     return END
 
 def route_after_readiness(state: InterviewState) -> str:
     """Routes after candidate readiness check."""
     curr = state.get("current_state", "")
-    if curr == "SKILL_SELECTION" and state.get("selected_skill"):
-        return "skill_selection"
-    elif curr == "CLARIFICATION":
-        return "clarification"
-    return END
-
-def route_after_skill_selection(state: InterviewState) -> str:
-    """Routes to question delivery once a skill is locked."""
-    if state.get("selected_skill") and state.get("current_question_text"):
+    if state.get("agent_response"):
+        return END
+    if curr == "LISTENING" and state.get("current_question_text"):
         return "question_delivery"
+    if curr == "CLARIFICATION":
+        return "clarification"
+    if curr == "PAUSED":
+        return "pause"
+    if curr == "TERMINATED":
+        return "voluntary_termination"
     return END
 
 def route_after_skip_classification(state: InterviewState) -> str:
     """Routes after candidate clarifies their skip preference."""
+    if state.get("agent_response"):
+        return END
     pref = state.get("skip_preference")
     retry = state.get("clarification_retry_count", 0)
     if pref == "UNCLEAR" and retry <= 1:
         return "ask_clarification"
-    # Return END because classify_skip_preference_node already delivers the next question
-    # and constructs the full agent response.
-    return END
+    if state.get("current_state") == "ROUTE_AFTER_Q3":
+        return "route_after_q3"
+    return "question_delivery"
 
 def route_after_answer(state: InterviewState) -> str:
     """Routes after evaluating candidate answer."""
-    if state.get("current_state") == "TERMINATED" or state.get("termination_reason"):
-        return END
-    # If agent_response is already constructed by answer_processing or its sub-nodes, preserve it
     if state.get("agent_response"):
+        return END
+    if state.get("termination_reason") == "TERMINATED_BY_CANDIDATE":
+        return "voluntary_termination"
+    if state.get("current_state") == "TERMINATED" or state.get("termination_reason"):
         return END
     if state.get("is_completed"):
         return "conclusion"
+    if state.get("is_paused"):
+        return "pause"
     if state.get("current_state") == "ROUTE_AFTER_Q3":
         return "route_after_q3"
-    if state.get("current_question_text") and state.get("agent_response") is None:
+    if state.get("current_state") == "SKIP_CONFIRMATION":
+        return "skip"
+    if state.get("current_question_text"):
         return "question_delivery"
     return END
 
@@ -134,16 +139,24 @@ def route_after_q3(state: InterviewState) -> str:
     return "conclusion"
 
 
+def _stop_if_responded(next_node: str):
+    """Returns END once a node has produced agent_response; otherwise documents flowchart transition."""
+    def _router(state: InterviewState) -> str:
+        if state.get("agent_response"):
+            return END
+        return next_node
+    return _router
+
+
 def create_interview_graph() -> StateGraph:
-    """Builds the authoritative LangGraph StateGraph for VANI 2.0."""
+    """Builds the authoritative LangGraph StateGraph for VANI 2.0 as a vertical top-down flowchart."""
     graph = StateGraph(InterviewState)
 
-    # 1. Register all 21 workflow nodes
+    # 1. Register workflow nodes (no skill_selection; skill is supplied at session init)
     graph.add_node("dispatch_turn", dispatch_turn_node)
     graph.add_node("greeting", greeting_node)
     graph.add_node("readiness", readiness_node)
     graph.add_node("clarification", clarification_node)
-    graph.add_node("skill_selection", skill_selection_node)
     graph.add_node("question_delivery", question_delivery_node)
     graph.add_node("answer_processing", answer_processing_node)
     graph.add_node("repeat", repeat_node)
@@ -162,7 +175,7 @@ def create_interview_graph() -> StateGraph:
     graph.add_node("conclusion", conclusion_node)
     graph.add_node("voluntary_termination", voluntary_termination_node)
 
-    # 2. Main Entry Dispatcher
+    # 2. Top-Down Entry Dispatcher (Stage Entry Points)
     graph.add_edge(START, "dispatch_turn")
     graph.add_conditional_edges(
         "dispatch_turn",
@@ -170,62 +183,88 @@ def create_interview_graph() -> StateGraph:
         {
             "greeting": "greeting",
             "readiness": "readiness",
-            "skill_selection": "skill_selection",
-            "classify_skip_preference": "classify_skip_preference",
             "answer_processing": "answer_processing",
+            "classify_skip_preference": "classify_skip_preference",
             "conclusion": "conclusion",
             "voluntary_termination": "voluntary_termination",
             END: END,
         },
     )
 
-    # 3. Conversational Transitions
-    graph.add_edge("greeting", END)
-
+    # 3. Stage 1: Greeting -> Readiness -> Clarification / Question Delivery
+    graph.add_conditional_edges(
+        "greeting",
+        _stop_if_responded("readiness"),
+        {"readiness": "readiness", END: END},
+    )
     graph.add_conditional_edges(
         "readiness",
         route_after_readiness,
         {
-            "skill_selection": "skill_selection",
             "clarification": "clarification",
+            "question_delivery": "question_delivery",
+            "pause": "pause",
+            "voluntary_termination": "voluntary_termination",
             END: END,
         },
     )
     graph.add_edge("clarification", END)
 
+    # 4. Stage 2: Question Delivery -> Answer Processing
     graph.add_conditional_edges(
-        "skill_selection",
-        route_after_skill_selection,
+        "question_delivery",
+        _stop_if_responded("answer_processing"),
+        {"answer_processing": "answer_processing", END: END},
+    )
+
+    graph.add_conditional_edges(
+        "answer_processing",
+        route_after_answer,
         {
+            "repeat": "repeat",
+            "example_clarification": "example_clarification",
+            "remaining_questions": "remaining_questions",
+            "correction": "correction",
+            "skill_switch": "skill_switch",
+            "recovery": "recovery",
+            "pause": "pause",
+            "skip": "skip",
             "question_delivery": "question_delivery",
+            "route_after_q3": "route_after_q3",
+            "conclusion": "conclusion",
+            "voluntary_termination": "voluntary_termination",
             END: END,
         },
     )
 
-    graph.add_edge("question_delivery", END)
+    # 5. Pause -> Resume Sub-Flow
+    graph.add_conditional_edges(
+        "pause",
+        _stop_if_responded("resume"),
+        {"resume": "resume", END: END},
+    )
+    graph.add_edge("resume", END)
 
+    # 6. Skip & FIFO Revisit Sub-Flow
+    graph.add_edge("skip", "ask_skip_confirmation")
+    graph.add_conditional_edges(
+        "ask_skip_confirmation",
+        _stop_if_responded("classify_skip_preference"),
+        {"classify_skip_preference": "classify_skip_preference", END: END},
+    )
     graph.add_conditional_edges(
         "classify_skip_preference",
         route_after_skip_classification,
         {
             "ask_clarification": "ask_clarification",
             "question_delivery": "question_delivery",
+            "route_after_q3": "route_after_q3",
             END: END,
         },
     )
     graph.add_edge("ask_clarification", END)
 
-    graph.add_conditional_edges(
-        "answer_processing",
-        route_after_answer,
-        {
-            "question_delivery": "question_delivery",
-            "route_after_q3": "route_after_q3",
-            "conclusion": "conclusion",
-            END: END,
-        },
-    )
-
+    # 7. Stage 3: Post-Q3 Revisit Check -> Conclusion -> END
     graph.add_conditional_edges(
         "route_after_q3",
         route_after_q3,
@@ -234,192 +273,243 @@ def create_interview_graph() -> StateGraph:
             "conclusion": "conclusion",
         },
     )
-
-    # 4. Turn Utilities
-    graph.add_edge("skip", "ask_skip_confirmation")
-    graph.add_edge("ask_skip_confirmation", END)
-    graph.add_edge("repeat", END)
-    graph.add_edge("pause", END)
-    graph.add_edge("resume", END)
-    graph.add_edge("skill_switch", END)
-    graph.add_edge("remaining_questions", END)
-    graph.add_edge("example_clarification", END)
-    graph.add_edge("correction", END)
-    graph.add_edge("recovery", END)
+    graph.add_conditional_edges(
+        "voluntary_termination",
+        _stop_if_responded("conclusion"),
+        {"conclusion": "conclusion", END: END},
+    )
     graph.add_edge("conclusion", END)
-    graph.add_edge("voluntary_termination", END)
+
+    # 8. In-Turn Helpers
+    graph.add_edge("repeat", END)
+    graph.add_edge("example_clarification", END)
+    graph.add_edge("remaining_questions", END)
+    graph.add_edge("correction", END)
+    graph.add_edge("skill_switch", END)
+    graph.add_edge("recovery", END)
 
     return graph
 
 
+def compile_interview_graph(custom_checkpointer: Optional[Any] = None) -> Any:
+    """Compiles the VANI 2.0 StateGraph with an optional LangGraph checkpointer."""
+    workflow = create_interview_graph()
+    if custom_checkpointer is not None:
+        return workflow.compile(checkpointer=custom_checkpointer)
+    return workflow.compile()
+
+
 # Compiled authoritative interview graph with memory checkpointer
 checkpointer = MemorySaver()
-interview_graph = create_interview_graph().compile(checkpointer=checkpointer)
+interview_graph = compile_interview_graph(custom_checkpointer=checkpointer)
 
 
 class InterviewEngine:
-    """Session-aware interviewer orchestrator that drives LangGraph turns directly."""
+    """Session-aware interviewer orchestrator that drives LangGraph turns with per-session locking and recovery."""
 
     def __init__(self) -> None:
         self.graph = interview_graph
+        self._session_locks: Dict[str, asyncio.Lock] = {}
+
+    def _get_session_lock(self, session_id: str) -> asyncio.Lock:
+        """Returns a per-session asyncio.Lock to serialize concurrent turns and timeouts."""
+        if not session_id or not session_id.strip():
+            raise ValueError("session_id must be a non-empty string")
+        if session_id not in self._session_locks:
+            self._session_locks[session_id] = asyncio.Lock()
+        return self._session_locks[session_id]
+
+    def cleanup_session_thread(self, session_id: str) -> None:
+        """Releases in-memory lock and checkpointer state for a concluded session."""
+        self._session_locks.pop(session_id, None)
+        if hasattr(checkpointer, "delete_thread"):
+            try:
+                checkpointer.delete_thread(session_id)
+            except Exception as exc:
+                logger.debug("Checkpointer cleanup skipped for %s: %s", session_id, exc)
 
     async def start_interview(self, session_id: str) -> str:
         """Phase 1: Initiates a new session and returns the spoken greeting through LangGraph."""
-        session = session_manager.get_or_create(session_id)
-        
-        # Prevent duplicate greeting only if questions have already started
-        if session.greeting_completed and session.last_agent_utterance and len(session.candidate_answers) > 0:
-            return session.last_agent_utterance
+        async with self._get_session_lock(session_id):
+            session = session_manager.get_or_create(session_id)
 
-        session.current_state = "GREETING"
-        
-        initial_state: InterviewState = {
-            "session_id": session_id,
-            "current_state": "GREETING",
-            "primary_question_count": 0,
-            "max_primary_questions": session.max_primary_questions,
-            "follow_up_count_for_current_question": 0,
-            "max_follow_ups_per_question": session.max_follow_ups_per_question,
-            "presented_questions": [],
-            "candidate_answers": [],
-            "concepts_mentioned": [],
-            "unclear_or_missing_concepts": [],
-            "follow_up_history": [],
-            "is_paused": False,
-            "is_completed": False,
-            "stage_1_status": "NOT_STARTED",
-            "greeting_completed": False,
-            "off_topic_count": session.off_topic_count,
-            "warning_level": session.warning_level,
-            "readiness_status": "PENDING",
-            "session_status": "ACTIVE",
-        }
+            # Prevent duplicate greeting only if questions have already started
+            if session.greeting_completed and session.last_agent_utterance and len(session.candidate_answers) > 0:
+                return session.last_agent_utterance
 
-        config = {"configurable": {"thread_id": session_id}}
-        result = await self.graph.ainvoke(initial_state, config=config)
-        session.current_state = result.get("current_state", "AWAITING_CANDIDATE")
-        response = result.get("agent_response", "Hello! Welcome to your interview. I'm Vani, your AI interviewer. How are you doing today?")
-        session.last_agent_utterance = response
-        session.greeting_completed = True
-        return guardrails.enforce_output_length(response)
+            session.current_state = "GREETING"
+
+            initial_state: InterviewState = {
+                "session_id": session_id,
+                "current_state": "GREETING",
+                "selected_skill": session.selected_skill,
+                "primary_question_count": 0,
+                "max_primary_questions": session.max_primary_questions,
+                "follow_up_count_for_current_question": 0,
+                "max_follow_ups_per_question": session.max_follow_ups_per_question,
+                "presented_questions": [],
+                "candidate_answers": [],
+                "concepts_mentioned": [],
+                "unclear_or_missing_concepts": [],
+                "follow_up_history": [],
+                "is_paused": False,
+                "is_completed": False,
+                "stage_1_status": "NOT_STARTED",
+                "greeting_completed": False,
+                "off_topic_count": session.off_topic_count,
+                "warning_level": session.warning_level,
+                "readiness_status": "PENDING",
+                "session_status": "ACTIVE",
+            }
+
+            config = {"configurable": {"thread_id": session_id}}
+            try:
+                result = await self.graph.ainvoke(initial_state, config=config)
+                session.current_state = result.get("current_state", "AWAITING_CANDIDATE")
+                response = result.get("agent_response", "Hello! Welcome to your interview. I'm Vani, your AI interviewer. How are you doing today?")
+            except Exception as exc:
+                logger.exception("Error starting interview for session %s: %s", session_id, exc)
+                response = "Hello! Welcome to your interview. I'm Vani, your AI interviewer. How are you doing today?"
+                session.current_state = "AWAITING_CANDIDATE"
+
+            enforced = guardrails.enforce_output_length(response)
+            session.last_agent_utterance = enforced
+            session.greeting_completed = True
+            return enforced
 
     async def handle_preparation_timeout(self, session_id: str) -> str:
         """UC: Preparation timeout (20s) expires; prompt for readiness confirmation."""
-        session = session_manager.get_or_create(session_id)
-        if session.is_terminated():
+        async with self._get_session_lock(session_id):
+            session = session_manager.get_or_create(session_id)
+            if session.is_terminated():
+                return ""
+            if session.current_state == "PREPARATION_WAIT":
+                session.current_state = "READINESS_CONFIRMATION"
+                response = "Are you ready to proceed with your interview?"
+                session.last_agent_utterance = response
+                return response
             return ""
-        if session.current_state == "PREPARATION_WAIT":
-            session.current_state = "READINESS_CONFIRMATION"
-            response = "Are you ready to proceed with your interview?"
-            session.last_agent_utterance = response
-            return response
-        return ""
 
     async def handle_confirmation_timeout(self, session_id: str) -> str:
         """UC: Confirmation timeout expires; politely terminate the session."""
-        session = session_manager.get_or_create(session_id)
-        if session.is_terminated():
-            return ""
-        session.terminate_session("CONFIRMATION_TIMEOUT")
-        response = "That's alright. We'll close this session for now. You can take some time and try again later."
-        session.last_agent_utterance = response
-        return response
+        async with self._get_session_lock(session_id):
+            session = session_manager.get_or_create(session_id)
+            if session.is_terminated():
+                return ""
+            session.terminate_session("CONFIRMATION_TIMEOUT")
+            response = "That's alright. We'll close this session for now. You can take some time and try again later."
+            session.last_agent_utterance = response
+            self.cleanup_session_thread(session_id)
+            return response
 
     async def handle_answer_timeout(self, session_id: str) -> str:
         """Section 8 Answer Timeout: 30-second candidate answer window expires with no response."""
-        session = session_manager.get_or_create(session_id)
-        if session.is_terminated():
-            return ""
+        async with self._get_session_lock(session_id):
+            session = session_manager.get_or_create(session_id)
+            if session.is_terminated():
+                return ""
 
-        # Race condition handling: if candidate speech capture is in progress or already received, do not timeout
-        if session.answer_capture_state in ["ANSWER_CAPTURE_IN_PROGRESS", "ANSWER_RECEIVED"]:
-            return ""
+            # Race condition handling: if candidate speech capture is in progress or already received, do not timeout
+            if session.answer_capture_state in ["ANSWER_CAPTURE_IN_PROGRESS", "ANSWER_RECEIVED"]:
+                return ""
 
-        active_q_id = session.current_question_id or "unknown"
-        session.mark_timeout_unanswered(active_q_id)
+            active_q_id = session.current_question_id or "unknown"
+            session.mark_timeout_unanswered(active_q_id)
 
-        timeout_msg = "I understand you weren't able to provide an answer within the allotted time. Let's move on to the next question."
-        
-        # Advance to next primary question, next FIFO revisit, or conclusion
-        state_input: InterviewState = {
-            "session_id": session_id,
-            "candidate_utterance": "",
-            "current_state": session.current_state,
-        }
-        next_step = await next_question_node(state_input)
-        response = f"{timeout_msg} {next_step.get('agent_response', '')}".strip()
-        session.last_agent_utterance = response
-        return response
+            timeout_msg = "I understand you weren't able to provide an answer within the allotted time. Let's move on to the next question."
+
+            state_input: InterviewState = {
+                "session_id": session_id,
+                "candidate_utterance": "",
+                "current_state": session.current_state,
+            }
+            next_step = await next_question_node(state_input)
+            response = guardrails.enforce_output_length(
+                f"{timeout_msg} {next_step.get('agent_response', '')}".strip()
+            )
+            session.last_agent_utterance = response
+            return response
 
     async def handle_candidate_utterance(self, session_id: str, utterance: str) -> str:
         """Processes a spoken candidate turn purely through the authoritative LangGraph."""
-        session = session_manager.get_or_create(session_id)
+        async with self._get_session_lock(session_id):
+            session = session_manager.get_or_create(session_id)
 
-        # If already terminated or completed, reject further candidate turns
-        if session.is_terminated():
-            return "This interview session has already closed and concluded. Thank you for your time."
+            # If already terminated or completed (outside CONCLUSION inquiry window), reject further candidate turns
+            if session.is_terminated() or (session.is_completed and session.current_state != "CONCLUSION"):
+                return "This interview session has already closed and concluded. Thank you for your time."
 
-        clean_input = utterance.strip()
-        if not clean_input:
-            if session.current_state == "CONCLUSION":
-                return session.last_agent_utterance or "Your interview has completed. Thank you for your time."
-            # Silence handling (UC28)
-            rec = await recovery_node({"session_id": session_id})
-            return rec.get("agent_response", "I didn't hear anything. Could you please answer?")
+            clean_input = (utterance or "").strip()
+            if not clean_input:
+                if session.current_state == "CONCLUSION":
+                    return session.last_agent_utterance or "Your interview has completed. Thank you for your time."
+                # Silence handling (UC28)
+                rec = await recovery_node({"session_id": session_id})
+                return rec.get("agent_response", "I didn't hear anything. Could you please answer?")
 
-        # G01: Prompt injection check
-        is_safe, injection_msg = guardrails.check_prompt_injection(clean_input)
-        if not is_safe:
-            session.terminate_session("PROMPT_INJECTION")
-            return injection_msg
+            # G01: Prompt injection check (remain in current state and redirect safely)
+            is_safe, injection_msg = guardrails.check_prompt_injection(clean_input)
+            if not is_safe:
+                session.last_agent_utterance = injection_msg
+                return injection_msg
 
-        state_input: InterviewState = {
-            "session_id": session_id,
-            "candidate_utterance": clean_input,
-            "current_state": session.current_state,
-            "selected_skill": session.selected_skill,
-            "current_question_id": session.current_question_id,
-            "current_question_text": session.current_question_text,
-            "current_question_topic": session.current_question_topic,
-            "current_expected_concepts": session.current_expected_concepts,
-            "primary_question_count": session.primary_question_count,
-            "max_primary_questions": session.max_primary_questions,
-            "follow_up_count_for_current_question": session.follow_up_count_for_current_question,
-            "max_follow_ups_per_question": session.max_follow_ups_per_question,
-            "presented_questions": session.presented_questions,
-            "candidate_answers": session.candidate_answers,
-            "concepts_mentioned": session.concepts_mentioned,
-            "unclear_or_missing_concepts": session.unclear_or_missing_concepts,
-            "follow_up_history": session.follow_up_history,
-            "is_paused": session.is_paused,
-            "is_completed": session.is_completed,
-            "revisit_queue": session.revisit_queue,
-            "skipped_question_ids": session.skipped_question_ids,
-            "revisited_question_ids": session.revisited_question_ids,
-            "q2_revisit_completed": session.q2_revisit_completed,
-            "q3_completed": session.q3_completed,
-            "question_visit_mode": session.question_visit_mode,
-            "stage_1_status": session.stage_1_status,
-            "greeting_completed": session.greeting_completed,
-            "off_topic_count": session.off_topic_count,
-            "warning_level": session.warning_level,
-            "readiness_status": session.readiness_status,
-            "wait_reason": session.wait_reason,
-            "wait_started_at": session.wait_started_at,
-            "readiness_confirmation_count": session.readiness_confirmation_count,
-            "clarification_count": session.clarification_count,
-            "session_status": session.session_status,
-            "termination_reason": session.termination_reason,
-        }
+            state_input: InterviewState = {
+                "session_id": session_id,
+                "candidate_utterance": clean_input,
+                "current_state": session.current_state,
+                "selected_skill": session.selected_skill,
+                "current_question_id": session.current_question_id,
+                "current_question_text": session.current_question_text,
+                "current_question_topic": session.current_question_topic,
+                "current_expected_concepts": session.current_expected_concepts,
+                "primary_question_count": session.primary_question_count,
+                "max_primary_questions": session.max_primary_questions,
+                "follow_up_count_for_current_question": session.follow_up_count_for_current_question,
+                "max_follow_ups_per_question": session.max_follow_ups_per_question,
+                "presented_questions": session.presented_questions,
+                "candidate_answers": session.candidate_answers,
+                "concepts_mentioned": session.concepts_mentioned,
+                "unclear_or_missing_concepts": session.unclear_or_missing_concepts,
+                "follow_up_history": session.follow_up_history,
+                "is_paused": session.is_paused,
+                "is_completed": session.is_completed,
+                "revisit_queue": session.revisit_queue,
+                "skipped_question_ids": session.skipped_question_ids,
+                "revisited_question_ids": session.revisited_question_ids,
+                "q2_revisit_completed": session.q2_revisit_completed,
+                "q3_completed": session.q3_completed,
+                "question_visit_mode": session.question_visit_mode,
+                "stage_1_status": session.stage_1_status,
+                "greeting_completed": session.greeting_completed,
+                "off_topic_count": session.off_topic_count,
+                "warning_level": session.warning_level,
+                "readiness_status": session.readiness_status,
+                "wait_reason": session.wait_reason,
+                "wait_started_at": session.wait_started_at,
+                "readiness_confirmation_count": session.readiness_confirmation_count,
+                "clarification_count": session.clarification_count,
+                "session_status": session.session_status,
+                "termination_reason": session.termination_reason,
+            }
 
-        config = {"configurable": {"thread_id": session_id}}
-        result = await self.graph.ainvoke(state_input, config=config)
-        session.current_state = result.get("current_state", session.current_state)
-        if "is_paused" in result:
-            session.is_paused = bool(result["is_paused"])
-        if "is_completed" in result and result["is_completed"]:
-            session.is_completed = True
-        response = result.get("agent_response", "Thank you. Let us proceed.")
-        return guardrails.enforce_output_length(response)
+            config = {"configurable": {"thread_id": session_id}}
+            try:
+                result = await self.graph.ainvoke(state_input, config=config)
+                session.current_state = result.get("current_state", session.current_state)
+                if "is_paused" in result:
+                    session.is_paused = bool(result["is_paused"])
+                if "is_completed" in result and result["is_completed"]:
+                    session.is_completed = True
+                response = result.get("agent_response", "Thank you. Let us proceed.")
+            except Exception as exc:
+                logger.exception("LangGraph turn error in session %s: %s", session_id, exc)
+                rec = await recovery_node({"session_id": session_id})
+                response = rec.get("agent_response", "I did not quite catch that. Could you please repeat or elaborate on your answer?")
+
+            enforced = guardrails.enforce_output_length(response)
+            session.last_agent_utterance = enforced
+            if session.is_terminated():
+                self.cleanup_session_thread(session_id)
+            return enforced
 
 interview_engine = InterviewEngine()

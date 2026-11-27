@@ -3,8 +3,10 @@ from langchain_core.tools import tool
 from vani.mcp.server import (
     list_available_skills as _list_skills,
     get_skill_details as _get_details,
+    get_skill_few_shot_prompt as _get_skill_prompt,
     select_interview_skill as _select_skill,
     get_next_question as _get_question,
+    aget_next_question as _aget_question,
     save_interview_response as _save_response,
 )
 
@@ -17,6 +19,11 @@ def list_available_skills_tool() -> Dict[str, Any]:
 def get_skill_details_tool(skill: str) -> Dict[str, Any]:
     """Retrieve syllabus topics and metadata for a specific technical skill."""
     return _get_details(skill)
+
+@tool
+def get_skill_few_shot_prompt_tool(skill: str, sub_skill: Optional[str] = None) -> Dict[str, Any]:
+    """Fetch the system prompt and few-shot question generation prompt for a mother skill or sub-skill from DB."""
+    return _get_skill_prompt(skill, sub_skill=sub_skill)
 
 @tool
 def select_interview_skill_tool(session_id: str, skill: str) -> Dict[str, Any]:
@@ -42,6 +49,7 @@ def save_interview_response_tool(
 VANI_MCP_TOOLS = [
     list_available_skills_tool,
     get_skill_details_tool,
+    get_skill_few_shot_prompt_tool,
     select_interview_skill_tool,
     get_next_question_tool,
     save_interview_response_tool,
@@ -58,12 +66,20 @@ class MCPClient:
         return _get_details(skill)
 
     @staticmethod
+    def get_skill_few_shot_prompt(skill: str, sub_skill: Optional[str] = None) -> Dict[str, Any]:
+        return _get_skill_prompt(skill, sub_skill=sub_skill)
+
+    @staticmethod
     def select_interview_skill(session_id: str, skill: str) -> Dict[str, Any]:
         return _select_skill(session_id, skill)
 
     @staticmethod
-    def get_next_question(session_id: str, skill: Optional[str] = None) -> Dict[str, Any]:
-        return _get_question(session_id, skill)
+    def get_next_question(session_id: str, skill: Optional[str] = None, sub_skill: Optional[str] = None) -> Dict[str, Any]:
+        return _get_question(session_id, skill, sub_skill=sub_skill)
+
+    @staticmethod
+    async def aget_next_question(session_id: str, skill: Optional[str] = None, sub_skill: Optional[str] = None) -> Dict[str, Any]:
+        return await _aget_question(session_id, skill, sub_skill=sub_skill)
 
     @staticmethod
     def save_interview_response(

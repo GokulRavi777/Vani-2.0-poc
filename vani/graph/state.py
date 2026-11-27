@@ -5,6 +5,7 @@ class InterviewState(TypedDict, total=False):
     # Session Identifiers
     session_id: str
     selected_skill: Optional[str]
+    selected_sub_skill: Optional[str]
     
     # Question Tracking & Strict Limits
     current_question_id: Optional[str]

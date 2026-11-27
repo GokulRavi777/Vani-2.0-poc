@@ -4,12 +4,21 @@ export interface Candidate {
   email: string;
 }
 
+export interface SubSkillItem {
+  id: number;
+  name: string;
+  description: string;
+  topics: string[];
+  difficulty_levels: string[];
+}
+
 export interface SkillItem {
   id: string;
   name: string;
   category: string;
   description: string;
   available: boolean;
+  sub_skills: SubSkillItem[];
 }
 
 export interface SessionStatus {

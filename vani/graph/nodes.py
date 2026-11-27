@@ -13,6 +13,80 @@ from config.settings import settings
 
 logger = logging.getLogger("vani.graph.nodes")
 
+PAUSE_PHRASES = (
+    "please pause", "pause interview", "pause", "hold on",
+    "wait a minute", "give me a moment", "brb", "one second",
+)
+RESUME_PHRASES = ("please resume", "resume interview", "resume", "i am back", "continue", "ready now")
+VOLUNTARY_TERMINATION_PHRASES = (
+    "want to stop", "stop the interview", "stop interview", "end this session",
+    "end the session", "don't want to continue", "dont want to continue",
+    "terminate the interview", "terminate interview", "quit the interview",
+    "quit interview", "please end this session", "i don't want to continue",
+    "i dont want to continue",
+)
+PHASE1_REFUSAL_PHRASES = (
+    "don't want to continue", "dont want to continue",
+    "i don't want to continue", "i dont want to continue",
+)
+
+
+def _matches_any(lowered_text: str, phrases: tuple[str, ...]) -> bool:
+    """Returns True if any phrase appears in lowered_text."""
+    return any(p in lowered_text for p in phrases)
+
+
+async def _deliver_first_question(session: Any, skill: str, intro_prefix: str) -> Optional[Dict[str, Any]]:
+    """Selects skill via MCP, fetches DB few-shot prompt & generates Q1 via LLM, and builds state update."""
+    mcp_client.select_interview_skill(session.session_id, skill)
+    session.selected_skill = skill
+    q_res = await mcp_client.aget_next_question(
+        session.session_id,
+        skill,
+        sub_skill=session.selected_sub_skill,
+    )
+    if q_res.get("status") != "success":
+        return None
+    q_data = q_res["question"]
+    session.record_primary_question(
+        question_id=q_data["id"],
+        question_text=q_data["question_text"],
+        topic=q_data["topic"],
+        expected_concepts=q_data["expected_concepts"],
+    )
+    response = f"{intro_prefix}{q_data['question_text']}"
+    session.last_agent_utterance = response
+    session.current_state = "LISTENING"
+    return {
+        "selected_skill": skill,
+        "current_question_id": q_data["id"],
+        "current_question_text": q_data["question_text"],
+        "current_question_topic": q_data["topic"],
+        "current_expected_concepts": q_data["expected_concepts"],
+        "primary_question_count": session.primary_question_count,
+        "follow_up_count_for_current_question": 0,
+        "current_state": "LISTENING",
+        "agent_response": response,
+    }
+
+
+def _finalize_completed_session(session: Any, response: str) -> Dict[str, Any]:
+    """Marks a session COMPLETED, finalizes assessment, and cleans up in-memory context."""
+    session.terminal_outcome = "COMPLETED"
+    session.current_state = "COMPLETED"
+    session.session_status = "COMPLETED"
+    session.finalize_assessment()
+    session.mark_cleanup_completed()
+    session.last_agent_utterance = response
+    return {
+        "current_state": "COMPLETED",
+        "session_status": "COMPLETED",
+        "terminal_outcome": "COMPLETED",
+        "is_completed": True,
+        "cleanup_completed": True,
+        "agent_response": response,
+    }
+
 async def greeting_node(state: InterviewState) -> Dict[str, Any]:
     """Phase 1 - Step 2: Vani natural greeting and onboarding opening."""
     session = session_manager.get_or_create(state["session_id"])
@@ -26,7 +100,10 @@ async def greeting_node(state: InterviewState) -> Dict[str, Any]:
             "stage_1_status": session.stage_1_status,
         }
 
-    response = "Hello! Welcome to your interview. I'm Vani, your AI interviewer. How are you doing today?"
+    skill = session.selected_skill or "Python"
+    session.selected_skill = skill
+    skill_label = f"{skill} ({session.selected_sub_skill})" if session.selected_sub_skill else skill
+    response = f"Hello! Welcome to your {skill_label} interview. I'm Vani, your AI interviewer. How are you doing today?"
     session.greeting_completed = True
     session.stage_1_status = "IN_PROGRESS"
     session.current_state = "AWAITING_CANDIDATE"
@@ -79,13 +156,17 @@ async def readiness_node(state: InterviewState) -> Dict[str, Any]:
         return {"agent_response": injection_msg, "current_state": session.current_state}
 
     lowered = utterance.lower()
-    if any(w in lowered for w in ["please pause", "pause interview", "pause"]):
+    if _matches_any(lowered, ("please pause", "pause interview", "pause")):
         return await pause_node(state)
-    if any(w in lowered for w in ["please resume", "resume interview", "resume"]):
+    if _matches_any(lowered, ("please resume", "resume interview", "resume")):
         return await resume_node(state)
 
+    # Phase 1 candidate refusal -> polite termination with MSG_POLITE_TERMINATE
+    if _matches_any(lowered, PHASE1_REFUSAL_PHRASES):
+        return await polite_termination_node(state, message=MSG_POLITE_TERMINATE, reason="CANDIDATE_REFUSAL")
+
     # Section 7: Voluntary candidate termination check
-    if any(w in lowered for w in ["want to stop", "stop the interview", "stop interview", "end this session", "end the session", "don't want to continue", "dont want to continue", "terminate the interview", "terminate interview", "quit interview"]):
+    if _matches_any(lowered, VOLUNTARY_TERMINATION_PHRASES):
         return await voluntary_termination_node(state)
 
     # 3. Classify intent with context
@@ -118,8 +199,9 @@ async def readiness_node(state: InterviewState) -> Dict[str, Any]:
 
     # 5. Process Legitimate Phase 1 Intents
     if intent == "SOCIAL_RESPONSE":
+        skill = session.selected_skill or "Python"
         response = (
-            "Glad to hear that! Today's interview consists of three technical questions on Python fundamentals for beginners. "
+            f"Glad to hear that! Today's interview consists of three technical questions on {skill} fundamentals. "
             "Whenever you are ready, let me know and we can begin."
         )
         session.current_state = "AWAITING_CANDIDATE"
@@ -177,46 +259,22 @@ async def readiness_node(state: InterviewState) -> Dict[str, Any]:
 
     elif intent in ["READY", "READY_CONFIRMATION"]:
         # Candidate confirmed readiness -> Transition to Phase 2!
+        skill = session.selected_skill or "Python"
         session.stage_1_status = "READY_FOR_PHASE_2"
         session.readiness_status = "READY"
-        session.selected_skill = "Python"
-        mcp_client.select_interview_skill(session.session_id, "Python")
         session.current_state = "ASKING_QUESTION"
-        
-        q_res = mcp_client.get_next_question(session.session_id, "Python")
-        if q_res.get("status") == "success":
-            q_data = q_res["question"]
-            session.record_primary_question(
-                question_id=q_data["id"],
-                question_text=q_data["question_text"],
-                topic=q_data["topic"],
-                expected_concepts=q_data["expected_concepts"],
-            )
-            response = (
-                f"Wonderful! Today's interview consists of three foundational Python questions with follow-ups. "
-                f"Question one: {q_data['question_text']}"
-            )
-            session.last_agent_utterance = response
-            session.current_state = "LISTENING"
-            return {
-                "selected_skill": "Python",
-                "current_question_id": q_data["id"],
-                "current_question_text": q_data["question_text"],
-                "current_question_topic": q_data["topic"],
-                "current_expected_concepts": q_data["expected_concepts"],
-                "primary_question_count": session.primary_question_count,
-                "follow_up_count_for_current_question": 0,
-                "current_state": "LISTENING",
-                "stage_1_status": "READY_FOR_PHASE_2",
-                "readiness_status": "READY",
-                "agent_response": response,
-            }
-        else:
-            return await polite_termination_node(
-                state,
-                message="Unable to retrieve interview questions. Concluding session.",
-                reason="MCP_ERROR"
-            )
+
+        intro = f"Wonderful! Today's interview consists of three foundational {skill} questions with follow-ups. Question one: "
+        delivered = await _deliver_first_question(session, skill, intro)
+        if delivered is not None:
+            delivered["stage_1_status"] = "READY_FOR_PHASE_2"
+            delivered["readiness_status"] = "READY"
+            return delivered
+        return await polite_termination_node(
+            state,
+            message="Unable to retrieve interview questions. Concluding session.",
+            reason="MCP_ERROR"
+        )
 
     elif intent in ["NOT_READY", "NOT_READY_CONFIRMATION"]:
         return await polite_termination_node(state, message=MSG_POLITE_TERMINATE, reason="CANDIDATE_REFUSAL")
@@ -293,34 +351,11 @@ async def skill_selection_node(state: InterviewState) -> Dict[str, Any]:
         return {"agent_response": response, "current_state": "SKILL_SELECTION"}
 
     # UC07: Valid skill selected
-    mcp_client.select_interview_skill(session.session_id, selected)
     session.current_state = "ASKING_QUESTION"
-    
-    # Retrieve first question immediately
-    q_res = mcp_client.get_next_question(session.session_id, selected)
-    if q_res.get("status") == "success":
-        q_data = q_res["question"]
-        session.record_primary_question(
-            question_id=q_data["id"],
-            question_text=q_data["question_text"],
-            topic=q_data["topic"],
-            expected_concepts=q_data["expected_concepts"],
-        )
-        response = f"Great, let's begin your {selected} interview. Question one: {q_data['question_text']}"
-        session.last_agent_utterance = response
-        return {
-            "selected_skill": selected,
-            "current_question_id": q_data["id"],
-            "current_question_text": q_data["question_text"],
-            "current_question_topic": q_data["topic"],
-            "current_expected_concepts": q_data["expected_concepts"],
-            "primary_question_count": session.primary_question_count,
-            "follow_up_count_for_current_question": 0,
-            "current_state": "LISTENING",
-            "agent_response": response,
-        }
-    else:
-        return {"current_state": "CONCLUSION", "agent_response": "Unable to retrieve questions. Concluding interview."}
+    delivered = await _deliver_first_question(session, selected, f"Great, let's begin your {selected} interview. Question one: ")
+    if delivered is not None:
+        return delivered
+    return {"current_state": "CONCLUSION", "agent_response": "Unable to retrieve questions. Concluding interview."}
 
 async def question_delivery_node(state: InterviewState) -> Dict[str, Any]:
     """UC11, UC12: Retrieves and delivers primary technical question."""
@@ -330,7 +365,11 @@ async def question_delivery_node(state: InterviewState) -> Dict[str, Any]:
     if not session.can_ask_primary_question():
         return await conclusion_node(state)
 
-    q_res = mcp_client.get_next_question(session.session_id, session.selected_skill)
+    q_res = await mcp_client.aget_next_question(
+        session.session_id,
+        session.selected_skill,
+        sub_skill=session.selected_sub_skill,
+    )
     if q_res.get("status") != "success":
         return await conclusion_node(state)
 
@@ -449,11 +488,11 @@ async def classify_skip_preference_node(state: InterviewState) -> Dict[str, Any]
     lowered = utterance.lower()
 
     # Support pause during skip confirmation
-    if any(w in lowered for w in ["pause", "hold on", "wait a minute", "give me a moment", "brb", "one second"]):
+    if _matches_any(lowered, PAUSE_PHRASES):
         return await pause_node(state)
 
     # Section 7: Voluntary candidate termination check
-    if any(w in lowered for w in ["want to stop", "stop the interview", "stop interview", "end this session", "end the session", "don't want to continue", "dont want to continue", "terminate the interview", "terminate interview", "quit interview"]):
+    if _matches_any(lowered, VOLUNTARY_TERMINATION_PHRASES):
         return await voluntary_termination_node(state)
 
     pref = "UNCLEAR"
@@ -512,17 +551,17 @@ async def classify_skip_preference_node(state: InterviewState) -> Dict[str, Any]
             }
 
 async def example_clarification_node(state: InterviewState) -> Dict[str, Any]:
-    """UC34: Clarifies question with an example without consuming question slots or follow-ups."""
+    """UC34: Clarifies the active question by rephrasing it concisely without examples or hints."""
     session = session_manager.get_or_create(state["session_id"])
     active_q = session.current_question_text or "the current question"
     active_q_id = session.current_question_id or ""
-    
+
     # Check per-question clarification allowance (Max 1 per primary question)
     q_info = session.question_state.get(active_q_id, {})
     if q_info.get("clarification_count", 0) >= 1:
         response = (
-            f"I have already provided an example for this question. "
-            f"Please give it your best try, or let me know if you would like to skip it."
+            "I have already clarified this question. "
+            "Please give it your best try, or let me know if you would like to skip it."
         )
         session.last_agent_utterance = response
         return {
@@ -534,18 +573,20 @@ async def example_clarification_node(state: InterviewState) -> Dict[str, Any]:
     if active_q_id in session.question_state:
         session.question_state[active_q_id]["clarification_count"] = q_info.get("clarification_count", 0) + 1
 
-    topic = session.current_question_topic or session.selected_skill or "this topic"
-    
-    # Safe contextual examples for topics (do not reveal answers)
-    examples = {
-        "Data Structures & Mutability": "For example, consider storing latitude and longitude in a tuple so they cannot be accidentally altered, versus a shopping cart list where you need to append or remove items.",
-        "Dictionaries & Hash Maps": "For example, consider storing user contact info where their username is the key, allowing you to fetch their phone number instantly without checking every user in a list.",
-        "Functions & Scope": "For example, consider a function that adds two numbers. If it returns the sum, you can pass that result into another calculation, whereas print just displays it on the screen.",
-        "Control Flow & Error Handling": "For example, converting user input to an integer using int() inside a try block, and catching ValueError if they typed letters instead of digits.",
-    }
-    clarifying_example = examples.get(topic, f"For example, consider a real-world scenario involving {topic}. Could you share how you would approach that?")
-    
-    response = f"Sure, here is an example: {clarifying_example}"
+    topic = session.current_question_topic or session.selected_skill or "this concept"
+    res = await model_service.invoke_json(
+        prompt=(
+            f"Rephrase this interview question in one short, clear sentence for the candidate. "
+            f"Do NOT give any examples, hints, or answers. Question: {active_q}\n"
+            'Output JSON: {"rephrased": "..."}'
+        ),
+        system_prompt="You are a strict technical interviewer. Only rephrase the question in simple terms. Never provide examples, hints, or solutions.",
+    )
+    cleaned = QuestionValidator.clean_for_speech(res.get("rephrased", ""))
+    if not cleaned or "example" in cleaned.lower():
+        cleaned = f"In simpler terms, could you explain {topic} in your own words?"
+
+    response = f"To clarify: {cleaned}"
     session.last_agent_utterance = response
     return {
         "agent_response": response,
@@ -576,10 +617,14 @@ async def answer_processing_node(state: InterviewState, is_correction: bool = Fa
 
     lowered = utterance.lower()
 
-    # Hint request check (Section 7 Hint Policy)
-    hint_phrases = ["give me a hint", "can i get a hint", "hint please", "can you give a hint", "need a hint", "any hints"]
-    if any(h in lowered for h in hint_phrases):
-        response = "I can't provide hints during the assessment, but you can give it a try or choose to skip the question."
+    # Hint and Example request check (Strict Assessment Policy: no hints or examples)
+    hint_phrases = ("give me a hint", "can i get a hint", "hint please", "can you give a hint", "need a hint", "any hints")
+    example_phrases = (
+        "give me an example", "give an example", "can you give an example",
+        "example please", "clarify with an example", "another example",
+    )
+    if _matches_any(lowered, hint_phrases) or _matches_any(lowered, example_phrases):
+        response = "I can't provide hints or examples during the assessment, but I can clarify the question if needed, or you can choose to skip it."
         session.last_agent_utterance = response
         return {
             "agent_response": response,
@@ -591,11 +636,11 @@ async def answer_processing_node(state: InterviewState, is_correction: bool = Fa
         return await repeat_node(state)
 
     # UC25: Pause request check (Fast-Path)
-    if any(w in lowered for w in ["pause", "hold on", "wait a minute", "give me a moment", "brb", "one second"]):
+    if _matches_any(lowered, PAUSE_PHRASES):
         return await pause_node(state)
 
     # UC26: Resume request check (Fast-Path)
-    if any(w in lowered for w in ["resume", "i am back", "continue", "ready now"]):
+    if _matches_any(lowered, RESUME_PHRASES):
         return await resume_node(state)
 
     # G23: If session is paused, reject answer progression
@@ -636,8 +681,8 @@ async def answer_processing_node(state: InterviewState, is_correction: bool = Fa
     if any(w in lowered for w in skip_phrases):
         return await ask_skip_confirmation_node(state)
 
-    # UC34: Request an example or clarification (Fast-Path)
-    if any(w in lowered for w in ["give me an example", "give an example", "can you give an example", "example please", "clarify with an example", "another example", "can you clarify", "clarify please"]):
+    # UC34: Question clarification / rephrase request (Fast-Path, no examples/hints)
+    if any(w in lowered for w in ["can you clarify", "clarify please", "what do you mean", "rephrase the question", "clarify the question"]):
         return await example_clarification_node(state)
 
     # Skill confirmation check: if candidate repeats skill name when Q1 is fresh
@@ -677,15 +722,8 @@ async def answer_processing_node(state: InterviewState, is_correction: bool = Fa
             )
         return {"agent_response": policy_decision.message, "current_state": "LISTENING"}
 
-    # Section 7: Voluntary Candidate Termination (e.g. "I want to stop the interview", "Please end this session", "I don't want to continue")
-    voluntary_term_phrases = [
-        "want to stop", "stop the interview", "stop interview", "end this session",
-        "end the session", "don't want to continue", "dont want to continue",
-        "terminate the interview", "terminate interview", "quit the interview",
-        "quit interview", "please end this session", "i don't want to continue",
-        "i dont want to continue"
-    ]
-    if any(w in lowered for w in voluntary_term_phrases):
+    # Section 7: Voluntary Candidate Termination
+    if _matches_any(lowered, VOLUNTARY_TERMINATION_PHRASES):
         return await voluntary_termination_node(state)
 
     # UC30: Explicit conclusion request (Fast-Path)
@@ -982,59 +1020,13 @@ async def resume_node(state: InterviewState) -> Dict[str, Any]:
     }
 
 async def skill_switch_node(state: InterviewState) -> Dict[str, Any]:
-    """UC09, G11: Skill switch validation & execution."""
+    """UC09, G11: Skill is locked once the interview begins; reject switches and remain in current state."""
     session = session_manager.get_or_create(state["session_id"])
-    utterance = (state.get("candidate_utterance") or "").lower()
-
-    # Rule D / Immutability: Once primary questions have advanced past question 1 (or multiple answers given), reject skill switching
-    if session.primary_question_count > 1 or len(session.candidate_answers) > 1:
-        response = (
-            f"Skill switching is not permitted once the interview has started. "
-            f"We will continue with {session.selected_skill}. "
-            f"Our question: {session.current_question_text}"
-        )
-        session.last_agent_utterance = response
-        return {
-            "agent_response": response,
-            "current_state": "LISTENING",
-        }
-
-    # Detect requested target skill
-    target_skill = None
-    for s in settings.SUPPORTED_SKILLS:
-        if s.lower() in utterance:
-            target_skill = s
-            break
-
-    if target_skill and target_skill.lower() != (session.selected_skill or "").lower():
-        mcp_client.select_interview_skill(session.session_id, target_skill)
-        session.selected_skill = target_skill
-        q_res = mcp_client.get_next_question(session.session_id, target_skill)
-        if q_res.get("status") == "success":
-            q_data = q_res["question"]
-            session.record_primary_question(
-                question_id=q_data["id"],
-                question_text=q_data["question_text"],
-                topic=q_data["topic"],
-                expected_concepts=q_data["expected_concepts"],
-            )
-            response = f"Switching your interview to {target_skill}. Question: {q_data['question_text']}"
-            session.last_agent_utterance = response
-            return {
-                "selected_skill": target_skill,
-                "current_question_id": q_data["id"],
-                "current_question_text": q_data["question_text"],
-                "current_question_topic": q_data["topic"],
-                "current_expected_concepts": q_data["expected_concepts"],
-                "primary_question_count": session.primary_question_count,
-                "current_state": "LISTENING",
-                "agent_response": response,
-            }
-
+    locked_skill = session.selected_skill or "Python"
     active_q = session.current_question_text or "our current question"
     response = (
-        f"This interview session is currently set to {session.selected_skill or 'Python'}. "
-        f"Whenever you are ready, please share your thoughts on our question: {active_q}"
+        f"Your interview skill is locked to {locked_skill} for this session and cannot be changed. "
+        f"Let's continue with our question: {active_q}"
     )
     session.last_agent_utterance = response
     return {
@@ -1140,56 +1132,23 @@ async def conclusion_node(state: InterviewState) -> Dict[str, Any]:
 
         # 6. Section 5 & 6.5: Candidate says thank you
         if any(w in lowered for w in ["thank you", "thanks", "thank u", "thx"]):
-            response = "You're welcome. Your interview has now been completed. Have a good day."
-            session.terminal_outcome = "COMPLETED"
-            session.current_state = "COMPLETED"
-            session.session_status = "COMPLETED"
-            session.finalize_assessment()
-            session.mark_cleanup_completed()
-            session.last_agent_utterance = response
-            return {
-                "current_state": "COMPLETED",
-                "session_status": "COMPLETED",
-                "terminal_outcome": "COMPLETED",
-                "is_completed": True,
-                "cleanup_completed": True,
-                "agent_response": response,
-            }
+            return _finalize_completed_session(
+                session,
+                "You're welcome. Your interview has now been completed. Have a good day.",
+            )
 
         # 7. Section 6.5: Candidate says goodbye
         if any(w in lowered for w in ["goodbye", "bye", "see you", "have a good day", "have a great day"]):
-            response = "Thank you. Your interview has now been completed. Have a great day!"
-            session.terminal_outcome = "COMPLETED"
-            session.current_state = "COMPLETED"
-            session.session_status = "COMPLETED"
-            session.finalize_assessment()
-            session.mark_cleanup_completed()
-            session.last_agent_utterance = response
-            return {
-                "current_state": "COMPLETED",
-                "session_status": "COMPLETED",
-                "terminal_outcome": "COMPLETED",
-                "is_completed": True,
-                "cleanup_completed": True,
-                "agent_response": response,
-            }
+            return _finalize_completed_session(
+                session,
+                "Thank you. Your interview has now been completed. Have a great day!",
+            )
 
         # 8. General acknowledgement / other closing remarks
-        response = "Your interview has now been completed. Thank you for your time and have a good day."
-        session.terminal_outcome = "COMPLETED"
-        session.current_state = "COMPLETED"
-        session.session_status = "COMPLETED"
-        session.finalize_assessment()
-        session.mark_cleanup_completed()
-        session.last_agent_utterance = response
-        return {
-            "current_state": "COMPLETED",
-            "session_status": "COMPLETED",
-            "terminal_outcome": "COMPLETED",
-            "is_completed": True,
-            "cleanup_completed": True,
-            "agent_response": response,
-        }
+        return _finalize_completed_session(
+            session,
+            "Your interview has now been completed. Thank you for your time and have a good day.",
+        )
 
     # Initial conclusion entry (from Stage 2 after Q3/revisits are all completed)
     session.current_state = "CONCLUSION"

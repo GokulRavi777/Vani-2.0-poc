@@ -41,8 +41,8 @@ export const assessmentService = {
     const res = await api.get('/api/skills');
     return res.data.skills;
   },
-  createSession: async (skill: string = 'Python') => {
-    const res = await api.post('/api/sessions', { skill });
+  createSession: async (skill: string = 'Python', subSkill?: string | null) => {
+    const res = await api.post('/api/sessions', { skill, sub_skill: subSkill || null });
     return res.data;
   },
   startSession: async (sessionId: string) => {

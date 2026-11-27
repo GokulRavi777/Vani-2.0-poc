@@ -50,9 +50,40 @@ async def entrypoint(ctx: JobContext) -> None:
     session_id = ctx.room.name
     logger.info(f"Initializing VANI 2.0 Interview Session for room: {session_id}")
 
-    # Section 8 Requirement: Initialize session state with preselected Python skill
+    # Resolve pre-selected skill & sub_skill from job metadata or DB (fallback to Python)
+    import json
     sess = session_manager.get_or_create(session_id)
-    sess.selected_skill = "Python"
+    resolved_skill = sess.selected_skill
+    resolved_sub_skill = sess.selected_sub_skill
+
+    raw_job_meta = getattr(ctx.job, "metadata", "") or ""
+    if raw_job_meta:
+        try:
+            meta = json.loads(raw_job_meta)
+            resolved_skill = meta.get("skill") or resolved_skill
+            resolved_sub_skill = meta.get("sub_skill") or resolved_sub_skill
+        except Exception:
+            pass
+
+    if not resolved_skill:
+        try:
+            from backend.app.database import SessionLocal
+            from backend.app.models import InterviewSession
+            with SessionLocal() as db:
+                db_sess = db.query(InterviewSession).filter(InterviewSession.id == session_id).first()
+                if db_sess and db_sess.selected_skill:
+                    if "::" in db_sess.selected_skill:
+                        m_part, s_part = db_sess.selected_skill.split("::", 1)
+                        resolved_skill = m_part.strip()
+                        resolved_sub_skill = s_part.strip() or None
+                    else:
+                        resolved_skill = db_sess.selected_skill.strip()
+        except Exception as meta_err:
+            logger.warning(f"Could not load session skill from DB for {session_id}: {meta_err}")
+
+    sess.selected_skill = resolved_skill or "Python"
+    sess.selected_sub_skill = resolved_sub_skill
+    logger.info(f"Session {session_id} initialized with skill='{sess.selected_skill}', sub_skill='{sess.selected_sub_skill}'")
     if len(sess.candidate_answers) == 0:
         sess.greeting_completed = False
         sess.current_state = "GREETING"

@@ -46,11 +46,22 @@ class LiveKitService:
         )
         return token.to_jwt()
 
-    async def dispatch_agent(self, room_name: str, agent_name: str = "vani-interviewer") -> Optional[str]:
-        """Dispatches the VANI agent to the specified room."""
+    async def dispatch_agent(
+        self,
+        room_name: str,
+        agent_name: str = "vani-interviewer",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[str]:
+        """Dispatches the VANI agent to the specified room with optional skill metadata."""
         try:
+            import json
             lk = LiveKitAPI(self.livekit_url, self.api_key, self.api_secret)
-            req = CreateAgentDispatchRequest(agent_name=agent_name, room=room_name)
+            meta_str = json.dumps(metadata) if metadata else ""
+            req = CreateAgentDispatchRequest(
+                agent_name=agent_name,
+                room=room_name,
+                metadata=meta_str,
+            )
             dispatch = await lk.agent_dispatch.create_dispatch(req)
             logger.info("Successfully dispatched agent '%s' to room '%s' (dispatch_id: %s)", agent_name, room_name, dispatch.id)
             await lk.aclose()

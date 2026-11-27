@@ -11,6 +11,7 @@ export const AssessmentSetupPage: React.FC = () => {
   const navigate = useNavigate();
   const sessionId = location.state?.sessionId;
   const skill = location.state?.skill || 'Python';
+  const subSkill = location.state?.subSkill;
 
   const [micPermission, setMicPermission] = useState<'pending' | 'granted' | 'denied'>('pending');
   const [audioPlaybackChecked, setAudioPlaybackChecked] = useState<boolean>(false);
@@ -75,7 +76,9 @@ export const AssessmentSetupPage: React.FC = () => {
             <Radio className="w-4 h-4 animate-pulse" />
             <span>Pre-Flight Readiness Check</span>
           </div>
-          <h2 className="text-2xl font-bold text-slate-900">Assessment Setup: {skill}</h2>
+          <h2 className="text-2xl font-bold text-slate-900">
+            Assessment Setup: {skill}{subSkill ? ` — ${subSkill}` : ''}
+          </h2>
           <p className="text-slate-500 text-sm mt-1">
             Please review the interview guidelines and verify your microphone and speakers before beginning.
           </p>
@@ -89,7 +92,7 @@ export const AssessmentSetupPage: React.FC = () => {
           </h4>
           <ul className="list-disc pl-5 space-y-1.5 text-xs text-slate-600">
             <li>The assessment consists of three foundational technical questions with brief follow-ups.</li>
-            <li>You can speak naturally at any time; Vani supports pause, resume, and clarifying examples.</li>
+            <li>You can speak naturally at any time; Vani supports pause, resume, and question clarification.</li>
             <li>Ensure you are in a quiet room with minimal background noise.</li>
             <li>Headphones or earbuds are strongly recommended to avoid acoustic echo.</li>
           </ul>

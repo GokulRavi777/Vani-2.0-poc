@@ -26,12 +26,21 @@ class CandidateResponse(BaseModel):
     email: str
 
 
+class SubSkillItem(BaseModel):
+    id: int
+    name: str
+    description: str
+    topics: List[str] = []
+    difficulty_levels: List[str] = []
+
+
 class SkillItem(BaseModel):
     id: str
     name: str
     category: str
     description: str
     available: bool = True
+    sub_skills: List[SubSkillItem] = []
 
 
 class SkillsResponse(BaseModel):
@@ -40,6 +49,7 @@ class SkillsResponse(BaseModel):
 
 class CreateSessionRequest(BaseModel):
     skill: str = "Python"
+    sub_skill: Optional[str] = None
 
 
 class StartSessionResponse(BaseModel):

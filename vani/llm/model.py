@@ -32,20 +32,36 @@ class GeminiModelService:
             )
         return self._llm
 
-    async def invoke_json(self, prompt: str, system_prompt: Optional[str] = None) -> Dict[str, Any]:
-        """Invokes Gemini and reliably parses JSON output."""
-        llm = self.get_llm()
+    @staticmethod
+    def _build_messages(prompt: str, system_prompt: Optional[str] = None) -> list:
         messages = []
         if system_prompt:
             messages.append(SystemMessage(content=system_prompt))
         messages.append(HumanMessage(content=prompt))
+        return messages
 
+    async def invoke_json(self, prompt: str, system_prompt: Optional[str] = None) -> Dict[str, Any]:
+        """Invokes Gemini asynchronously and reliably parses JSON output."""
+        llm = self.get_llm()
+        messages = self._build_messages(prompt, system_prompt)
         try:
             response = await llm.ainvoke(messages)
             text = self._extract_text(response.content)
             return self._parse_json_from_text(text)
         except Exception as e:
             logger.error(f"Error invoking Gemini model: {e}")
+            return {"error": str(e), "raw_text": ""}
+
+    def invoke_json_sync(self, prompt: str, system_prompt: Optional[str] = None) -> Dict[str, Any]:
+        """Invokes Gemini synchronously and reliably parses JSON output."""
+        llm = self.get_llm()
+        messages = self._build_messages(prompt, system_prompt)
+        try:
+            response = llm.invoke(messages)
+            text = self._extract_text(response.content)
+            return self._parse_json_from_text(text)
+        except Exception as e:
+            logger.error(f"Error invoking Gemini model (sync): {e}")
             return {"error": str(e), "raw_text": ""}
 
     def _extract_text(self, content: Any) -> str:

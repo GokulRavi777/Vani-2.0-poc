@@ -7,6 +7,7 @@ from config.settings import settings
 class SessionState:
     session_id: str
     selected_skill: Optional[str] = None
+    selected_sub_skill: Optional[str] = None
     current_question_id: Optional[str] = None
     current_question_text: Optional[str] = None
     current_question_topic: Optional[str] = None
