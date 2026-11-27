@@ -1,8 +1,10 @@
+import asyncio
 import time
 import logging
 from typing import Dict, Any, Optional
 from vani.graph.state import InterviewState
 from vani.session.manager import session_manager
+from vani.session.persistence import persist_session_evaluation
 from vani.mcp.client import mcp_client
 from vani.llm.model import model_service
 from vani.llm.question_generator import question_generator, QuestionValidator
@@ -138,22 +140,24 @@ async def polite_termination_node(
     }
 
 async def readiness_node(state: InterviewState) -> Dict[str, Any]:
-    """Phase 1 - Step 3 & Step 4: Candidate response handling, nervousness, time requests, and universal off-topic."""
+    """Phase 1 - Readiness & Guardrail Gatekeeper: enforces universal + Stage 1 node guardrails without repeated waits."""
     session = session_manager.get_or_create(state["session_id"])
     utterance = (state.get("candidate_utterance") or "").strip()
+    skill = session.selected_skill or "Python"
 
-    # 1. If already terminated, reject any further input
+    # 1. Universal Guardrail: If already terminated, reject any further input
     if session.is_terminated():
-        return await polite_termination_node(
-            state,
-            message=session.last_agent_utterance or MSG_POLITE_TERMINATE,
-            reason=session.termination_reason or "SESSION_TERMINATED"
-        )
+        return {
+            "stage_1_route": "termination",
+            "termination_reason": session.termination_reason or "SESSION_TERMINATED",
+            "agent_response": session.last_agent_utterance or MSG_POLITE_TERMINATE,
+        }
 
-    # 2. Check prompt injection guardrail
+    # 2. Universal Guardrail (G01): Prompt injection check — redirect safely without terminating
     is_safe, injection_msg = guardrails.check_prompt_injection(utterance)
     if not is_safe:
-        return {"agent_response": injection_msg, "current_state": session.current_state}
+        session.last_agent_utterance = injection_msg
+        return {"stage_1_route": "end", "agent_response": injection_msg, "current_state": session.current_state}
 
     lowered = utterance.lower()
     if _matches_any(lowered, ("please pause", "pause interview", "pause")):
@@ -161,15 +165,33 @@ async def readiness_node(state: InterviewState) -> Dict[str, Any]:
     if _matches_any(lowered, ("please resume", "resume interview", "resume")):
         return await resume_node(state)
 
-    # Phase 1 candidate refusal -> polite termination with MSG_POLITE_TERMINATE
+    # 3. Stage 1 Node Guardrail: Reject skill switching (skill is locked at session init)
+    skill_switch_triggers = (
+        "change skill", "switch skill", "switch language", "change language",
+        "different skill", "different language", "switch to", "questions in",
+    )
+    if _matches_any(lowered, skill_switch_triggers):
+        response = f"Your interview skill is locked to {skill} for this session. Are you ready to begin?"
+        session.current_state = "AWAITING_CANDIDATE"
+        session.last_agent_utterance = response
+        return {"stage_1_route": "end", "agent_response": response, "current_state": "AWAITING_CANDIDATE"}
+
+    # 4. Phase 1 candidate refusal -> polite termination with MSG_POLITE_TERMINATE
     if _matches_any(lowered, PHASE1_REFUSAL_PHRASES):
-        return await polite_termination_node(state, message=MSG_POLITE_TERMINATE, reason="CANDIDATE_REFUSAL")
+        return {
+            "stage_1_route": "termination",
+            "termination_reason": "CANDIDATE_REFUSAL",
+            "agent_response": MSG_POLITE_TERMINATE,
+        }
 
-    # Section 7: Voluntary candidate termination check
+    # 5. Universal Voluntary Termination check
     if _matches_any(lowered, VOLUNTARY_TERMINATION_PHRASES):
-        return await voluntary_termination_node(state)
+        return {
+            "stage_1_route": "voluntary_termination",
+            "termination_reason": "TERMINATED_BY_CANDIDATE",
+        }
 
-    # 3. Classify intent with context
+    # 6. Classify Phase 1 intent with context
     res = await model_service.classify_phase1_intent(
         candidate_utterance=utterance,
         current_node=session.current_state,
@@ -180,7 +202,7 @@ async def readiness_node(state: InterviewState) -> Dict[str, Any]:
     intent = res.get("intent", "UNCLEAR")
     logger.info(f"Phase 1 candidate turn: '{utterance}' -> intent: {intent}")
 
-    # 4. Universal Policy & Off-Topic Validation across all stages
+    # 7. Universal Policy & Off-Topic Validation (1st redirect, 2nd warn, 3rd terminate)
     policy_decision = guardrails.handle_candidate_policy(
         session=session,
         candidate_intent=intent,
@@ -188,106 +210,76 @@ async def readiness_node(state: InterviewState) -> Dict[str, Any]:
         current_node=session.current_state,
         utterance=utterance,
     )
-    if policy_decision.action == "REDIRECT":
+    if policy_decision.action in ("REDIRECT", "WARN"):
         session.last_agent_utterance = policy_decision.message
-        return {"agent_response": policy_decision.message, "current_state": session.current_state}
-    elif policy_decision.action == "WARN":
-        session.last_agent_utterance = policy_decision.message
-        return {"agent_response": policy_decision.message, "current_state": session.current_state}
+        return {"stage_1_route": "end", "agent_response": policy_decision.message, "current_state": session.current_state}
     elif policy_decision.action == "TERMINATE":
-        return await polite_termination_node(state, message=policy_decision.message, reason="REPEATED_OFF_TOPIC_INTERACTIONS")
+        return {
+            "stage_1_route": "termination",
+            "termination_reason": "REPEATED_OFF_TOPIC_INTERACTIONS",
+            "agent_response": policy_decision.message,
+        }
 
-    # 5. Process Legitimate Phase 1 Intents
+    # 8. Process Legitimate Phase 1 Intents (bounded — never wait repeatedly)
     if intent == "SOCIAL_RESPONSE":
-        skill = session.selected_skill or "Python"
         response = (
             f"Glad to hear that! Today's interview consists of three technical questions on {skill} fundamentals. "
             "Whenever you are ready, let me know and we can begin."
         )
         session.current_state = "AWAITING_CANDIDATE"
         session.last_agent_utterance = response
-        return {"agent_response": response, "current_state": "AWAITING_CANDIDATE"}
+        return {"stage_1_route": "end", "agent_response": response, "current_state": "AWAITING_CANDIDATE"}
 
-    elif intent == "NERVOUSNESS":
-        response = "That's completely fine. Take your time. I'll give you a few moments to get comfortable."
-        session.readiness_status = "PENDING"
-        session.wait_reason = "NERVOUSNESS"
-        session.wait_started_at = time.time()
-        session.current_state = "PREPARATION_WAIT"
-        session.last_agent_utterance = response
+    elif intent in ("NERVOUSNESS", "REQUEST_TIME"):
+        # Node-level guardrail: allow at most ONE preparation wait per session
+        if session.wait_started_at is None:
+            return {
+                "stage_1_route": "preparation_wait",
+                "wait_reason": intent,
+                "current_intent": intent,
+            }
+        # Already waited once -> do not wait repeatedly; ask for final readiness or terminate
+        if session.current_state != "READINESS_CONFIRMATION" and session.clarification_count < 1:
+            session.clarification_count += 1
+            session.current_state = "READINESS_CONFIRMATION"
+            response = "I've already given you a moment to get comfortable. Are you ready to proceed with your interview now?"
+            session.last_agent_utterance = response
+            return {"stage_1_route": "end", "agent_response": response, "current_state": "READINESS_CONFIRMATION"}
         return {
-            "agent_response": response,
-            "current_state": "PREPARATION_WAIT",
-            "readiness_status": "PENDING",
-            "wait_reason": "NERVOUSNESS",
-            "wait_started_at": session.wait_started_at,
+            "stage_1_route": "termination",
+            "termination_reason": "CONFIRMATION_TIMEOUT",
+            "agent_response": MSG_POLITE_TERMINATE,
         }
 
-    elif intent == "REQUEST_TIME":
-        response = "Of course. Take a moment. I'll wait for you."
-        session.readiness_status = "PENDING"
-        session.wait_reason = "REQUEST_TIME"
-        session.wait_started_at = time.time()
-        session.current_state = "PREPARATION_WAIT"
+    elif intent in ("VANI_QUESTION", "PROCESS_QUESTION", "CLARIFICATION"):
+        if session.clarification_count < 2:
+            return {
+                "stage_1_route": "onboarding",
+                "current_intent": intent,
+            }
+        session.current_state = "READINESS_CONFIRMATION"
+        response = f"We're ready to start your {skill} interview. Would you like to begin now?"
         session.last_agent_utterance = response
-        return {
-            "agent_response": response,
-            "current_state": "PREPARATION_WAIT",
-            "readiness_status": "PENDING",
-            "wait_reason": "REQUEST_TIME",
-            "wait_started_at": session.wait_started_at,
-        }
+        return {"stage_1_route": "end", "agent_response": response, "current_state": "READINESS_CONFIRMATION"}
 
-    elif intent == "VANI_QUESTION":
-        response = (
-            "I am Vani, an AI technical interviewer built to conduct conversational technical interviews. "
-            "Today we will cover core Python fundamentals for beginners. Are you ready to begin?"
-        )
-        session.current_state = "AWAITING_CANDIDATE"
-        session.last_agent_utterance = response
-        return {"agent_response": response, "current_state": "AWAITING_CANDIDATE"}
-
-    elif intent == "PROCESS_QUESTION":
-        response = (
-            "The interview consists of three primary technical questions with brief follow-ups. "
-            "You can answer naturally by voice, ask me to repeat a question, or pause whenever you need. "
-            "Whenever you are ready, let me know and we will get started!"
-        )
-        session.current_state = "AWAITING_CANDIDATE"
-        session.last_agent_utterance = response
-        return {"agent_response": response, "current_state": "AWAITING_CANDIDATE"}
-
-    elif intent in ["READY", "READY_CONFIRMATION"]:
-        # Candidate confirmed readiness -> Transition to Phase 2!
-        skill = session.selected_skill or "Python"
+    elif intent in ("READY", "READY_CONFIRMATION"):
         session.stage_1_status = "READY_FOR_PHASE_2"
         session.readiness_status = "READY"
         session.current_state = "ASKING_QUESTION"
+        return {
+            "stage_1_route": "question_delivery",
+            "selected_skill": skill,
+            "stage_1_status": "READY_FOR_PHASE_2",
+            "readiness_status": "READY",
+            "current_state": "ASKING_QUESTION",
+        }
 
-        intro = f"Wonderful! Today's interview consists of three foundational {skill} questions with follow-ups. Question one: "
-        delivered = await _deliver_first_question(session, skill, intro)
-        if delivered is not None:
-            delivered["stage_1_status"] = "READY_FOR_PHASE_2"
-            delivered["readiness_status"] = "READY"
-            return delivered
-        return await polite_termination_node(
-            state,
-            message="Unable to retrieve interview questions. Concluding session.",
-            reason="MCP_ERROR"
-        )
-
-    elif intent in ["NOT_READY", "NOT_READY_CONFIRMATION"]:
-        return await polite_termination_node(state, message=MSG_POLITE_TERMINATE, reason="CANDIDATE_REFUSAL")
-
-    elif intent == "CLARIFICATION":
-        response = (
-            "This interview is designed to evaluate your understanding of Python fundamentals through three core questions. "
-            "You can answer naturally by voice, ask to repeat questions, or pause at any point. "
-            "Whenever you are ready, please say 'ready' to start!"
-        )
-        session.current_state = "AWAITING_CANDIDATE"
-        session.last_agent_utterance = response
-        return {"agent_response": response, "current_state": "AWAITING_CANDIDATE"}
+    elif intent in ("NOT_READY", "NOT_READY_CONFIRMATION"):
+        return {
+            "stage_1_route": "termination",
+            "termination_reason": "CANDIDATE_REFUSAL",
+            "agent_response": MSG_POLITE_TERMINATE,
+        }
 
     elif intent == "UNCLEAR":
         if session.clarification_count < 1:
@@ -295,15 +287,78 @@ async def readiness_node(state: InterviewState) -> Dict[str, Any]:
             response = "Just to confirm, would you like to proceed with your interview now?"
             session.current_state = "AWAITING_CANDIDATE"
             session.last_agent_utterance = response
-            return {"agent_response": response, "current_state": "AWAITING_CANDIDATE"}
-        else:
-            return await polite_termination_node(state, message=MSG_POLITE_TERMINATE, reason="CONFIRMATION_TIMEOUT")
+            return {"stage_1_route": "end", "agent_response": response, "current_state": "AWAITING_CANDIDATE"}
+        return {
+            "stage_1_route": "termination",
+            "termination_reason": "CONFIRMATION_TIMEOUT",
+            "agent_response": MSG_POLITE_TERMINATE,
+        }
 
     else:
-        # NO_INPUT
         response = "I didn't quite catch that. Whenever you are ready to begin, please let me know!"
         session.last_agent_utterance = response
-        return {"agent_response": response, "current_state": session.current_state}
+        return {"stage_1_route": "end", "agent_response": response, "current_state": session.current_state}
+
+
+async def onboarding_node(state: InterviewState) -> Dict[str, Any]:
+    """Stage 1: Answers brief questions about VANI or the interview process and returns to readiness."""
+    session = session_manager.get_or_create(state["session_id"])
+    skill = session.selected_skill or "Python"
+    intent = state.get("current_intent", "PROCESS_QUESTION")
+    session.clarification_count += 1
+
+    if intent == "VANI_QUESTION":
+        response = (
+            f"I am Vani, an AI technical interviewer built to conduct conversational technical interviews. "
+            f"Today we will cover {skill} fundamentals. Are you ready to begin?"
+        )
+    elif intent == "PROCESS_QUESTION":
+        response = (
+            "The interview consists of three primary technical questions with brief follow-ups. "
+            "You can answer naturally by voice, ask me to repeat a question, or pause whenever you need. "
+            "Whenever you are ready, let me know and we will get started!"
+        )
+    else:
+        response = (
+            f"This interview evaluates your understanding of {skill} fundamentals through three core questions. "
+            "You can answer naturally by voice, ask to repeat questions, or pause at any point. "
+            "Whenever you are ready, please say 'ready' to start!"
+        )
+
+    session.current_state = "AWAITING_CANDIDATE"
+    session.last_agent_utterance = response
+    return {"agent_response": response, "current_state": "AWAITING_CANDIDATE"}
+
+
+async def preparation_wait_node(state: InterviewState) -> Dict[str, Any]:
+    """Stage 1: Grants one bounded preparation hold for nervousness or time requests."""
+    session = session_manager.get_or_create(state["session_id"])
+    reason = state.get("wait_reason") or "REQUEST_TIME"
+
+    if reason == "NERVOUSNESS":
+        response = "That's completely fine. Take your time. I'll give you a few moments to get comfortable."
+    else:
+        response = "Of course. Take a moment. I'll wait for you."
+
+    session.readiness_status = "PENDING"
+    session.wait_reason = reason
+    session.wait_started_at = time.time()
+    session.current_state = "PREPARATION_WAIT"
+    session.last_agent_utterance = response
+    return {
+        "agent_response": response,
+        "current_state": "PREPARATION_WAIT",
+        "readiness_status": "PENDING",
+        "wait_reason": reason,
+        "wait_started_at": session.wait_started_at,
+    }
+
+
+async def stage1_termination_node(state: InterviewState) -> Dict[str, Any]:
+    """Stage 1: Politely terminates session on refusal, timeout, or repeated off-topic violations."""
+    reason = state.get("termination_reason") or "POLITE_TERMINATION"
+    msg = state.get("agent_response") or MSG_POLITE_TERMINATE
+    return await polite_termination_node(state, message=msg, reason=reason)
 
 async def clarification_node(state: InterviewState) -> Dict[str, Any]:
     """UC04, UC20: Candidate clarification handling."""
@@ -384,8 +439,17 @@ async def question_delivery_node(state: InterviewState) -> Dict[str, Any]:
     q_num = session.primary_question_count
     num_words = ["one", "two", "three"]
     word_num = num_words[q_num - 1] if q_num <= 3 else str(q_num)
-    
-    response = f"Question {word_num}: {q_data['question_text']}"
+
+    if q_num == 1:
+        skill = session.selected_skill or "Python"
+        response = (
+            f"Wonderful! Today's interview consists of three foundational {skill} questions with follow-ups. "
+            f"Question one: {q_data['question_text']}"
+        )
+    else:
+        ack_prefix = (state.get("ack_text") or "").strip()
+        q_str = f"Question {word_num}: {q_data['question_text']}"
+        response = f"{ack_prefix} {q_str}".strip() if ack_prefix else q_str
     session.last_agent_utterance = response
 
     return {
@@ -394,6 +458,7 @@ async def question_delivery_node(state: InterviewState) -> Dict[str, Any]:
         "current_question_topic": q_data["topic"],
         "current_expected_concepts": q_data["expected_concepts"],
         "primary_question_count": session.primary_question_count,
+        "remaining_questions": session.remaining_questions,
         "follow_up_count_for_current_question": 0,
         "current_state": "LISTENING",
         "agent_response": response,
@@ -606,18 +671,19 @@ async def correction_node(state: InterviewState) -> Dict[str, Any]:
     return await answer_processing_node(state, is_correction=True)
 
 async def answer_processing_node(state: InterviewState, is_correction: bool = False) -> Dict[str, Any]:
-    """UC13, UC14, UC16, UC18, UC19, UC21-27, UC31-35: Analyzes answer and determines routing."""
+    """Stage 2 Gatekeeper: enforces guardrails, classifies fast-paths, evaluates answer, and sets stage_2_route."""
     session = session_manager.get_or_create(state["session_id"])
     utterance = state.get("candidate_utterance", "").strip()
 
-    # G01: Prompt injection check
+    # 1. G01: Prompt injection check (redirect safely without terminating)
     is_safe, msg = guardrails.check_prompt_injection(utterance)
     if not is_safe:
-        return {"agent_response": msg, "current_state": "LISTENING"}
+        session.last_agent_utterance = msg
+        return {"stage_2_route": "end", "agent_response": msg, "current_state": "LISTENING"}
 
     lowered = utterance.lower()
 
-    # Hint and Example request check (Strict Assessment Policy: no hints or examples)
+    # 2. Hint & Example request check (Strict Assessment Policy: no hints or examples)
     hint_phrases = ("give me a hint", "can i get a hint", "hint please", "can you give a hint", "need a hint", "any hints")
     example_phrases = (
         "give me an example", "give an example", "can you give an example",
@@ -626,86 +692,82 @@ async def answer_processing_node(state: InterviewState, is_correction: bool = Fa
     if _matches_any(lowered, hint_phrases) or _matches_any(lowered, example_phrases):
         response = "I can't provide hints or examples during the assessment, but I can clarify the question if needed, or you can choose to skip it."
         session.last_agent_utterance = response
-        return {
-            "agent_response": response,
-            "current_state": "LISTENING",
-        }
+        return {"stage_2_route": "end", "agent_response": response, "current_state": "LISTENING"}
 
-    # UC24: Repeat request check (Fast-Path)
-    if any(w in lowered for w in ["repeat", "say that again", "pardon", "rephrase", "what was the question"]):
-        return await repeat_node(state)
-
-    # UC25: Pause request check (Fast-Path)
+    # 3. UC25 / UC26: Pause & Resume Fast-Paths
     if _matches_any(lowered, PAUSE_PHRASES):
-        return await pause_node(state)
-
-    # UC26: Resume request check (Fast-Path)
+        return {"stage_2_route": "pause"}
     if _matches_any(lowered, RESUME_PHRASES):
-        return await resume_node(state)
+        return {"stage_2_route": "resume"}
 
     # G23: If session is paused, reject answer progression
     if session.is_paused:
-        return {"agent_response": "The interview is paused. Please say 'resume' when you are ready to continue."}
+        response = "The interview is paused. Please say 'resume' when you are ready to continue."
+        return {"stage_2_route": "end", "agent_response": response, "current_state": "PAUSED"}
 
-    # UC31: Remaining questions query (Fast-Path)
+    # 4. UC24: Repeat request check
+    if any(w in lowered for w in ["repeat", "say that again", "pardon", "rephrase", "what was the question"]):
+        return {"stage_2_route": "repeat"}
+
+    # 5. UC31: Remaining questions query
     if any(w in lowered for w in ["how many questions", "how many more", "how many left", "questions remain", "questions left"]):
-        return await remaining_questions_node(state)
+        return {"stage_2_route": "remaining_questions"}
 
-    # UC32: Skip question request
-    # If candidate explicitly requests to skip this question directly (e.g. "I would like to skip this question please")
-    direct_skip_phrases = [
+    # 6. UC32: Direct skip or Dynamic Skip Confirmation
+    direct_skip_phrases = (
         "i would like to skip this question please",
         "skip this question please",
         "i want to skip this question please",
         "skip this question directly",
-    ]
-    if any(p in lowered for p in direct_skip_phrases):
+    )
+    if _matches_any(lowered, direct_skip_phrases):
         session.mark_permanent_skip(session.current_question_id or "")
         session.current_state = "LISTENING"
         if session.primary_question_count >= session.max_primary_questions:
-            return await route_after_q3_node(state)
-        q_state = await question_delivery_node(state)
-        q_state["agent_response"] = f"Understood on skipping. {q_state.get('agent_response', '')}"
-        q_state["skip_preference"] = "SKIP_ENTIRELY"
-        return q_state
+            return {"stage_2_route": "route_after_q3", "skip_preference": "SKIP_ENTIRELY"}
+        return {
+            "stage_2_route": "question_delivery",
+            "ack_text": "Understood on skipping.",
+            "skip_preference": "SKIP_ENTIRELY",
+        }
 
-    # Dynamic Skip Confirmation & Revisit (e.g. "Can we skip this question?", "I don't know. Can we skip this?", "I want to come back to this later.")
-    skip_phrases = [
-        "skip", "skip question", "skip this question", "pass on this", 
+    skip_phrases = (
+        "skip", "skip question", "skip this question", "pass on this",
         "next question please", "next question", "don't want to answer",
-        "move to the next question", "move on to the next question", 
+        "move to the next question", "move on to the next question",
         "move to next question", "let's move to the next question",
         "i don't know can we skip", "can we skip", "come back to this later",
-        "i want to come back to this later", "come back later"
-    ]
-    if any(w in lowered for w in skip_phrases):
-        return await ask_skip_confirmation_node(state)
+        "i want to come back to this later", "come back later",
+    )
+    if _matches_any(lowered, skip_phrases):
+        return {"stage_2_route": "skip"}
 
-    # UC34: Question clarification / rephrase request (Fast-Path, no examples/hints)
+    # 7. UC34: Question clarification / rephrase request (no examples/hints)
     if any(w in lowered for w in ["can you clarify", "clarify please", "what do you mean", "rephrase the question", "clarify the question"]):
-        return await example_clarification_node(state)
+        return {"stage_2_route": "example_clarification"}
 
-    # Skill confirmation check: if candidate repeats skill name when Q1 is fresh
+    # 8. Skill confirmation check when Q1 is fresh
     if session.primary_question_count == 1 and len(session.candidate_answers) == 0:
         supported_lowered = [s.lower() for s in settings.SUPPORTED_SKILLS]
         if lowered in supported_lowered or any(lowered == f"{s} please" for s in supported_lowered):
             active_q = session.current_question_text or "our first question"
             return {
+                "stage_2_route": "end",
                 "agent_response": f"Great, let's proceed with {session.selected_skill or 'Python'}. Question one: {active_q}",
-                "current_state": "LISTENING"
+                "current_state": "LISTENING",
             }
 
-    # UC33: Answer correction check
+    # 9. UC33: Answer correction check
     if not is_correction and any(w in lowered for w in ["let me correct", "correction:", "sorry correction", "what i meant was", "actually wait"]):
-        return await correction_node(state)
+        return {"stage_2_route": "correction"}
 
-    # Off-topic Fast-Path check (prevents LLM fallback failures under rate-limits)
-    off_topic_triggers = [
+    # 10. Off-topic Fast-Path check
+    off_topic_triggers = (
         "tell me a joke", "play some music", "sing a song", "write a poem",
         "what is the weather", "who is the president", "sing me a song",
-        "tell a joke", "play music", "write poem"
-    ]
-    if any(ot in lowered for ot in off_topic_triggers):
+        "tell a joke", "play music", "write poem",
+    )
+    if _matches_any(lowered, off_topic_triggers):
         policy_decision = guardrails.handle_candidate_policy(
             session=session,
             candidate_intent="OFF_TOPIC",
@@ -715,42 +777,36 @@ async def answer_processing_node(state: InterviewState, is_correction: bool = Fa
         )
         session.last_agent_utterance = policy_decision.message
         if policy_decision.should_terminate:
-            return await polite_termination_node(
-                state,
-                message=policy_decision.message,
-                reason="REPEATED_OFF_TOPIC_INTERACTIONS"
-            )
-        return {"agent_response": policy_decision.message, "current_state": "LISTENING"}
+            return {
+                "stage_2_route": "termination",
+                "termination_reason": "REPEATED_OFF_TOPIC_INTERACTIONS",
+                "agent_response": policy_decision.message,
+            }
+        return {"stage_2_route": "end", "agent_response": policy_decision.message, "current_state": "LISTENING"}
 
-    # Section 7: Voluntary Candidate Termination
+    # 11. Voluntary Candidate Termination
     if _matches_any(lowered, VOLUNTARY_TERMINATION_PHRASES):
-        return await voluntary_termination_node(state)
+        return {"stage_2_route": "voluntary_termination"}
 
-    # UC30: Explicit conclusion request (Fast-Path)
-    conclusion_phrases = [
-        "end interview", "conclude interview", 
-        "conclude", "finish interview", "finish this interview", "finish this call",
-        "finish call", "end the interview",
-        "wrap up", "that's all", "thats all"
-    ]
-    if any(w in lowered for w in conclusion_phrases):
-        return await conclusion_node(state)
+    # 12. UC30: Explicit conclusion request
+    conclusion_phrases = (
+        "end interview", "conclude interview", "conclude", "finish interview",
+        "finish this interview", "finish this call", "finish call",
+        "end the interview", "wrap up", "that's all", "thats all",
+    )
+    if _matches_any(lowered, conclusion_phrases):
+        return {"stage_2_route": "conclusion"}
 
-    # UC09: Skill change request check
-    skill_switch_triggers = [
+    # 13. UC09 / G11: Skill change request (skill is locked)
+    skill_switch_triggers = (
         "change skill", "switch skill", "switch language", "change language",
         "change the programming language", "change programming language",
-        "different skill", "different language", "switch to", "kavali", "questions in"
-    ]
-    if any(trigger in lowered for trigger in skill_switch_triggers):
-        for s in sorted(settings.SUPPORTED_SKILLS, key=len, reverse=True):
-            if s.lower() in lowered and s.lower() != (session.selected_skill or "").lower():
-                return await skill_switch_node(state)
-    if any(w in lowered for w in ["change skill", "switch skill", "switch language", "change language"]):
-        return await skill_switch_node(state)
+        "different skill", "different language", "switch to", "kavali", "questions in",
+    )
+    if _matches_any(lowered, skill_switch_triggers):
+        return {"stage_2_route": "skill_switch"}
 
-    # Phase B Optimization: Unified Single-Turn Structured LLM Call
-    # Combines Intent Analysis, Concept Extraction, and Follow-Up Generation in ONE Gemini inference!
+    # 14. Unified Single-Turn Structured LLM Evaluation
     unified_prompt = prompt_builder.build_unified_turn_prompt(
         skill=session.selected_skill or "Python",
         topic=session.current_question_topic or "Technical Fundamentals",
@@ -769,13 +825,9 @@ async def answer_processing_node(state: InterviewState, is_correction: bool = Fa
     intent = decision.get("detected_intent", "PROVIDE_ANSWER")
     concepts = decision.get("concepts_identified", [])
     missing = decision.get("missing_concepts", [])
-    ack = decision.get("acknowledgment", "Got it.")
+    ack = QuestionValidator.clean_for_speech(decision.get("acknowledgment", "Got it."))
     needs_follow_up = decision.get("needs_follow_up", False)
-    follow_up_q = decision.get("follow_up_question", "")
-
-    # Clean text for speech
-    ack = QuestionValidator.clean_for_speech(ack)
-    follow_up_q = QuestionValidator.clean_for_speech(follow_up_q)
+    follow_up_q = QuestionValidator.clean_for_speech(decision.get("follow_up_question", ""))
 
     # Save candidate response in session via MCP
     mcp_client.save_interview_response(
@@ -786,17 +838,12 @@ async def answer_processing_node(state: InterviewState, is_correction: bool = Fa
         missing_concepts=missing,
     )
 
-    # Route based on state and follow-up limits
-    can_follow_up = session.can_ask_follow_up()
-
-    # Revisit Mode: Answering a revisited question marks it completed and processes the next queued revisit or conclusion
+    # Revisit Mode: Answering a revisited question completes it and moves to next FIFO revisit or conclusion
     if session.question_visit_mode == "REVISIT":
         session.mark_revisit_completed(session.current_question_id or "", answered=True)
-        if session.has_pending_revisit():
-            return await route_after_q3_node(state)
-        return await conclusion_node(state)
+        return {"stage_2_route": "route_after_q3"}
 
-    # UC22: Universal Off-Topic Policy Enforcement across all stages
+    # UC22: Universal Off-Topic Policy Enforcement
     if intent == "OFF_TOPIC":
         policy_decision = guardrails.handle_candidate_policy(
             session=session,
@@ -807,36 +854,26 @@ async def answer_processing_node(state: InterviewState, is_correction: bool = Fa
         )
         session.last_agent_utterance = policy_decision.message
         if policy_decision.should_terminate:
-            return await polite_termination_node(
-                state,
-                message=policy_decision.message,
-                reason="REPEATED_OFF_TOPIC_INTERACTIONS"
-            )
-        return {"agent_response": policy_decision.message, "current_state": "LISTENING"}
-
-    # UC21 & Handling Does Not Know
-    if intent == "DOES_NOT_KNOW":
-        if can_follow_up:
-            follow_up_text = f"No worries at all, that is completely fine. How do you typically approach {session.current_question_topic or session.selected_skill} in your daily work?"
-            session.record_follow_up(
-                question_id=session.current_question_id or "",
-                question_text=session.current_question_text or "",
-                follow_up_text=follow_up_text,
-                candidate_answer=utterance,
-            )
-            session.last_agent_utterance = follow_up_text
             return {
-                "current_question_text": follow_up_text,
-                "follow_up_count_for_current_question": session.follow_up_count_for_current_question,
-                "current_state": "LISTENING",
-                "agent_response": follow_up_text,
+                "stage_2_route": "termination",
+                "termination_reason": "REPEATED_OFF_TOPIC_INTERACTIONS",
+                "agent_response": policy_decision.message,
             }
-        else:
-            return await next_question_node(state)
+        return {"stage_2_route": "end", "agent_response": policy_decision.message, "current_state": "LISTENING"}
 
-    # UC16, UC18, UC19: Follow-up or Cross-Question
+    can_follow_up = session.can_ask_follow_up()
+
+    # UC21 & DOES_NOT_KNOW -> route to follow_up node if allowed
+    if intent == "DOES_NOT_KNOW" and can_follow_up:
+        fb_q = f"No worries at all, that is completely fine. How do you typically approach {session.current_question_topic or session.selected_skill} in your daily work?"
+        return {
+            "stage_2_route": "follow_up",
+            "ack_text": "",
+            "follow_up_text": fb_q,
+        }
+
+    # UC16, UC18, UC19: Follow-up or Cross-Question -> route to follow_up node
     if needs_follow_up and can_follow_up and follow_up_q and len(follow_up_q) > 10:
-        # Validate generated question
         is_valid, _ = QuestionValidator.validate_question(
             follow_up_q,
             skill=session.selected_skill or "Python",
@@ -844,25 +881,45 @@ async def answer_processing_node(state: InterviewState, is_correction: bool = Fa
             max_words=settings.MAX_SPOKEN_RESPONSE_WORDS,
         )
         if not is_valid:
-            follow_up_q = f"Could you elaborate on how you would implement that in practice?"
-
-        spoken_utterance = f"{ack} {follow_up_q}".strip()
-        session.record_follow_up(
-            question_id=session.current_question_id or "",
-            question_text=session.current_question_text or "",
-            follow_up_text=follow_up_q,
-            candidate_answer=utterance,
-        )
-        session.last_agent_utterance = spoken_utterance
+            follow_up_q = "Could you elaborate on how you would implement that in practice?"
         return {
-            "current_question_text": follow_up_q,
-            "follow_up_count_for_current_question": session.follow_up_count_for_current_question,
-            "current_state": "LISTENING",
-            "agent_response": spoken_utterance,
+            "stage_2_route": "follow_up",
+            "ack_text": ack,
+            "follow_up_text": follow_up_q,
         }
 
-    # Otherwise move to next question (UC15 / UC23)
-    return await next_question_node(state)
+    # Otherwise exit loop if remaining_questions == 1 (last question), else ask next question
+    if session.is_last_primary_question() or not session.can_ask_primary_question():
+        session.q3_completed = True
+        return {"stage_2_route": "route_after_q3"}
+
+    return {
+        "stage_2_route": "question_delivery",
+        "ack_text": "Thank you for that response. Let's move on to the next topic.",
+    }
+
+
+async def stage2_follow_up_node(state: InterviewState) -> Dict[str, Any]:
+    """Stage 2: Delivers one bounded follow-up/cross-question and updates session counters."""
+    session = session_manager.get_or_create(state["session_id"])
+    follow_up_q = (state.get("follow_up_text") or "").strip() or "Could you elaborate on how you would implement that in practice?"
+    ack = (state.get("ack_text") or "").strip()
+    utterance = (state.get("candidate_utterance") or "").strip()
+
+    spoken_utterance = f"{ack} {follow_up_q}".strip()
+    session.record_follow_up(
+        question_id=session.current_question_id or "",
+        question_text=session.current_question_text or "",
+        follow_up_text=follow_up_q,
+        candidate_answer=utterance,
+    )
+    session.last_agent_utterance = spoken_utterance
+    return {
+        "current_question_text": follow_up_q,
+        "follow_up_count_for_current_question": session.follow_up_count_for_current_question,
+        "current_state": "LISTENING",
+        "agent_response": spoken_utterance,
+    }
 
 async def elaboration_node(state: InterviewState, utterance: str, concepts: list, missing: list) -> Dict[str, Any]:
     """UC16: Short-answer elaboration."""
@@ -1168,4 +1225,17 @@ async def conclusion_node(state: InterviewState) -> Dict[str, Any]:
         "conclusion_started": True,
         "assessment_finalized": True,
         "agent_response": response,
+    }
+
+
+async def finalization_node(state: InterviewState) -> Dict[str, Any]:
+    """Stage 3 Aftermath: Persists full conversation + evaluation to PostgreSQL and cleans up."""
+    session = session_manager.get_or_create(state["session_id"])
+    session.finalize_assessment()
+    await asyncio.to_thread(persist_session_evaluation, session)
+    session.mark_cleanup_completed()
+    return {
+        "cleanup_completed": True,
+        "assessment_finalized": True,
+        "final_assessment": session.final_assessment,
     }

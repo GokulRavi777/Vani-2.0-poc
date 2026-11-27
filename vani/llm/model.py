@@ -131,6 +131,7 @@ class GeminiModelService:
         # Fast-Path 3: Request Time / Preparation Wait
         time_phrases = [
             "give me a minute", "give me a moment", "one minute", "need a minute",
+            "another minute", "more time", "one more moment", "wait more",
             "need a moment", "wait a second", "wait a minute", "hold on", "give me time",
             "couple of minutes", "few seconds", "few moments", "wait for me"
         ]

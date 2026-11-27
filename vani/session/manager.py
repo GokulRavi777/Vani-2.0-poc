@@ -13,15 +13,17 @@ class SessionState:
     current_question_topic: Optional[str] = None
     current_expected_concepts: List[str] = field(default_factory=list)
     
-    # Strict Question Limits
+    # Strict Question Limits & Universal Countdown
     primary_question_count: int = 0
     max_primary_questions: int = settings.MAX_PRIMARY_QUESTIONS
+    remaining_questions: int = settings.MAX_PRIMARY_QUESTIONS
     follow_up_count_for_current_question: int = 0
     max_follow_ups_per_question: int = settings.MAX_FOLLOW_UPS_PER_QUESTION
-    
+
     # Session History & Context
     presented_questions: List[str] = field(default_factory=list)
     candidate_answers: List[Dict[str, Any]] = field(default_factory=list)
+    conversation_turns: List[Dict[str, Any]] = field(default_factory=list)
     concepts_mentioned: List[str] = field(default_factory=list)
     unclear_or_missing_concepts: List[str] = field(default_factory=list)
     follow_up_history: List[Dict[str, Any]] = field(default_factory=list)
@@ -166,23 +168,49 @@ class SessionState:
     answer_timer_duration: float = 30.0
     answer_capture_state: str = "WAITING_FOR_ANSWER"  # WAITING_FOR_ANSWER, ANSWER_CAPTURE_IN_PROGRESS, ANSWER_RECEIVED
 
+    def record_turn(self, speaker: str, text: str, question_id: Optional[str] = None) -> None:
+        """Appends a spoken turn to the full session conversation transcript."""
+        if not text:
+            return
+        self.conversation_turns.append({
+            "turn": len(self.conversation_turns) + 1,
+            "speaker": speaker,
+            "text": text,
+            "question_id": question_id or self.current_question_id,
+            "timestamp": time.time(),
+        })
+
+    def get_qa_context_summary(self, max_items: int = 6) -> str:
+        """Builds compact iterative Q&A + follow-up context for next-question prompt generation."""
+        if not self.candidate_answers and not self.follow_up_history:
+            return "None"
+        lines: List[str] = []
+        for idx, ans in enumerate(self.candidate_answers[-max_items:], 1):
+            q_txt = (ans.get("question_text") or "")[:120]
+            a_txt = (ans.get("answer_text") or "")[:150]
+            lines.append(f"Q{idx}: {q_txt} | A{idx}: {a_txt}")
+        for f_idx, fu in enumerate(self.follow_up_history[-3:], 1):
+            lines.append(f"FollowUp{f_idx}: {fu.get('follow_up_question', '')[:120]}")
+        return "\n".join(lines)
+
     def can_ask_primary_question(self) -> bool:
-        """Enforces that no more than 3 primary questions can be asked."""
+        """Enforces that no more than max_primary_questions can be asked."""
         return self.primary_question_count < self.max_primary_questions
 
+    def is_last_primary_question(self) -> bool:
+        """Returns True when the universal countdown reaches 1 (current question is the last one)."""
+        return self.remaining_questions <= 1
+
     def can_ask_follow_up(self) -> bool:
-        """Enforces that maximum 1 follow-up can be asked per primary question (Q3 excluded from follow-up)."""
-        # Preserve existing Q3 follow-up restriction (no follow-up on Q3)
-        if self.primary_question_count >= self.max_primary_questions:
-            return False
-        # No follow-up during revisit
+        """Enforces that maximum 1 follow-up can be asked per primary question (including Q3; revisits excluded)."""
         if self.question_visit_mode == "REVISIT":
             return False
         return self.follow_up_count_for_current_question < self.max_follow_ups_per_question
 
     def record_primary_question(self, question_id: str, question_text: str, topic: str = "", expected_concepts: Optional[List[str]] = None) -> None:
-        """Records presentation of a new primary question and initializes its per-question state contract."""
+        """Records presentation of a new primary question and updates the universal countdown."""
         self.primary_question_count += 1
+        self.remaining_questions = max(1, self.max_primary_questions - self.primary_question_count + 1)
         self.current_question_id = question_id
         self.current_question_text = question_text
         self.current_question_topic = topic

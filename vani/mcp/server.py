@@ -397,6 +397,7 @@ def _prepare_prompt_inputs(
         for q_id, q_info in session.question_state.items()
     ] or session.presented_questions
 
+    qa_context = session.get_qa_context_summary() if hasattr(session, "get_qa_context_summary") else "None"
     formatted_prompt = record["few_shot_prompt"].format(
         skill=record["mother_skill"],
         sub_skill=record["sub_skill"],
@@ -406,6 +407,8 @@ def _prepare_prompt_inputs(
         concepts_explored=session.concepts_mentioned or "None",
         remaining_primary_allowance=session.max_primary_questions - session.primary_question_count,
     )
+    if qa_context and qa_context != "None":
+        formatted_prompt = f"{formatted_prompt}\n\n### PREVIOUS Q&A & FOLLOW-UPS IN THIS SESSION\n{qa_context}"
     return {
         "record": record,
         "topic": topic,

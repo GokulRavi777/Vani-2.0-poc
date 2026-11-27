@@ -7,9 +7,12 @@ from vani.graph.state import InterviewState
 from vani.graph.nodes import (
     greeting_node,
     readiness_node,
-    clarification_node,
+    onboarding_node,
+    preparation_wait_node,
+    stage1_termination_node,
     question_delivery_node,
     answer_processing_node,
+    stage2_follow_up_node,
     repeat_node,
     pause_node,
     resume_node,
@@ -24,6 +27,7 @@ from vani.graph.nodes import (
     correction_node,
     recovery_node,
     conclusion_node,
+    finalization_node,
     next_question_node,
     voluntary_termination_node,
 )
@@ -33,70 +37,54 @@ from config.settings import settings
 
 logger = logging.getLogger("vani.graph.workflow")
 
-# Entry node for dispatching conversational turns
-async def dispatch_turn_node(state: InterviewState) -> Dict[str, Any]:
-    """Authoritative entry node that prepares turn state from the session manager."""
+def route_from_start(state: InterviewState) -> str:
+    """Routes directly from START without an artificial dispatch_turn node."""
     session_id = state.get("session_id", "default")
     session = session_manager.get_or_create(session_id)
-    
-    utterance = (state.get("candidate_utterance") or "").strip()
-    return {
-        "session_id": session_id,
-        "current_state": session.current_state,
-        "selected_skill": session.selected_skill,
-        "primary_question_count": session.primary_question_count,
-        "max_primary_questions": session.max_primary_questions,
-        "current_question_id": session.current_question_id,
-        "is_paused": session.is_paused,
-        "is_completed": session.is_completed,
-        "candidate_utterance": utterance,
-    }
-
-# Routing function from entry dispatch
-def route_dispatch(state: InterviewState) -> str:
-    """Routes conversational turn to the corresponding stage node."""
-    curr = state.get("current_state", "GREETING")
+    curr = session.current_state
     utterance = (state.get("candidate_utterance") or "").strip()
 
-    # If session is paused, route to answer_processing for pause/resume handling
-    if state.get("is_paused"):
+    if session.is_paused:
         return "answer_processing"
 
-    # If in CONCLUSION state, route to conclusion node
     if curr == "CONCLUSION":
         return "conclusion"
 
-    # Terminal state check
-    if curr in ["COMPLETED", "TERMINATED", "CLOSED"] or state.get("is_completed"):
-        if curr == "CONCLUSION":
-            return "conclusion"
+    if curr in ["COMPLETED", "TERMINATED", "CLOSED"] or session.is_completed:
         return END
 
-    # If primary questions have already started, route to answer_processing (or skip preference classification)
-    if state.get("primary_question_count", 0) > 0 and curr not in ["COMPLETED", "TERMINATED", "CLOSED"]:
+    if session.primary_question_count > 0:
         if curr == "SKIP_CONFIRMATION":
             return "classify_skip_preference"
         return "answer_processing"
 
     if curr == "GREETING" and not utterance:
         return "greeting"
-    elif curr in ["GREETING", "READINESS_CHECK", "INITIALIZATION", "AWAITING_CANDIDATE", "PREPARATION_WAIT", "READINESS_CONFIRMATION"]:
+    if curr in [
+        "GREETING",
+        "READINESS_CHECK",
+        "INITIALIZATION",
+        "AWAITING_CANDIDATE",
+        "PREPARATION_WAIT",
+        "READINESS_CONFIRMATION",
+    ]:
         return "readiness"
 
     return END
 
+
 def route_after_readiness(state: InterviewState) -> str:
-    """Routes after candidate readiness check."""
-    curr = state.get("current_state", "")
-    if state.get("agent_response"):
-        return END
-    if curr == "LISTENING" and state.get("current_question_text"):
+    """Routes Stage 1 readiness outcome to explicit Stage 1/2 nodes."""
+    route = state.get("stage_1_route", "end")
+    if route == "question_delivery":
         return "question_delivery"
-    if curr == "CLARIFICATION":
-        return "clarification"
-    if curr == "PAUSED":
-        return "pause"
-    if curr == "TERMINATED":
+    if route == "onboarding":
+        return "onboarding"
+    if route == "preparation_wait":
+        return "preparation_wait"
+    if route == "termination":
+        return "termination"
+    if route == "voluntary_termination":
         return "voluntary_termination"
     return END
 
@@ -113,23 +101,18 @@ def route_after_skip_classification(state: InterviewState) -> str:
     return "question_delivery"
 
 def route_after_answer(state: InterviewState) -> str:
-    """Routes after evaluating candidate answer."""
+    """Routes Stage 2 answer_processing outcome via real LangGraph edges."""
+    route = state.get("stage_2_route")
+    if route:
+        return END if route == "end" else route
     if state.get("agent_response"):
         return END
     if state.get("termination_reason") == "TERMINATED_BY_CANDIDATE":
         return "voluntary_termination"
     if state.get("current_state") == "TERMINATED" or state.get("termination_reason"):
-        return END
+        return "termination"
     if state.get("is_completed"):
         return "conclusion"
-    if state.get("is_paused"):
-        return "pause"
-    if state.get("current_state") == "ROUTE_AFTER_Q3":
-        return "route_after_q3"
-    if state.get("current_state") == "SKIP_CONFIRMATION":
-        return "skip"
-    if state.get("current_question_text"):
-        return "question_delivery"
     return END
 
 def route_after_q3(state: InterviewState) -> str:
@@ -152,13 +135,15 @@ def create_interview_graph() -> StateGraph:
     """Builds the authoritative LangGraph StateGraph for VANI 2.0 as a vertical top-down flowchart."""
     graph = StateGraph(InterviewState)
 
-    # 1. Register workflow nodes (no skill_selection; skill is supplied at session init)
-    graph.add_node("dispatch_turn", dispatch_turn_node)
+    # 1. Register workflow nodes (greeting is the first node on START)
     graph.add_node("greeting", greeting_node)
     graph.add_node("readiness", readiness_node)
-    graph.add_node("clarification", clarification_node)
+    graph.add_node("onboarding", onboarding_node)
+    graph.add_node("preparation_wait", preparation_wait_node)
+    graph.add_node("termination", stage1_termination_node)
     graph.add_node("question_delivery", question_delivery_node)
     graph.add_node("answer_processing", answer_processing_node)
+    graph.add_node("follow_up", stage2_follow_up_node)
     graph.add_node("repeat", repeat_node)
     graph.add_node("pause", pause_node)
     graph.add_node("resume", resume_node)
@@ -173,25 +158,24 @@ def create_interview_graph() -> StateGraph:
     graph.add_node("correction", correction_node)
     graph.add_node("recovery", recovery_node)
     graph.add_node("conclusion", conclusion_node)
+    graph.add_node("finalization", finalization_node)
     graph.add_node("voluntary_termination", voluntary_termination_node)
 
-    # 2. Top-Down Entry Dispatcher (Stage Entry Points)
-    graph.add_edge(START, "dispatch_turn")
+    # 2. Direct Conditional Entry from START (greeting is first node)
     graph.add_conditional_edges(
-        "dispatch_turn",
-        route_dispatch,
+        START,
+        route_from_start,
         {
             "greeting": "greeting",
             "readiness": "readiness",
             "answer_processing": "answer_processing",
             "classify_skip_preference": "classify_skip_preference",
             "conclusion": "conclusion",
-            "voluntary_termination": "voluntary_termination",
             END: END,
         },
     )
 
-    # 3. Stage 1: Greeting -> Readiness -> Clarification / Question Delivery
+    # 3. Stage 1: Greeting -> Readiness -> Onboarding / Preparation Wait / Termination / Question Delivery
     graph.add_conditional_edges(
         "greeting",
         _stop_if_responded("readiness"),
@@ -201,14 +185,17 @@ def create_interview_graph() -> StateGraph:
         "readiness",
         route_after_readiness,
         {
-            "clarification": "clarification",
-            "question_delivery": "question_delivery",
-            "pause": "pause",
+            "onboarding": "onboarding",
+            "preparation_wait": "preparation_wait",
+            "termination": "termination",
             "voluntary_termination": "voluntary_termination",
+            "question_delivery": "question_delivery",
             END: END,
         },
     )
-    graph.add_edge("clarification", END)
+    graph.add_edge("onboarding", END)
+    graph.add_edge("preparation_wait", END)
+    graph.add_edge("termination", END)
 
     # 4. Stage 2: Question Delivery -> Answer Processing
     graph.add_conditional_edges(
@@ -221,6 +208,7 @@ def create_interview_graph() -> StateGraph:
         "answer_processing",
         route_after_answer,
         {
+            "follow_up": "follow_up",
             "repeat": "repeat",
             "example_clarification": "example_clarification",
             "remaining_questions": "remaining_questions",
@@ -228,14 +216,17 @@ def create_interview_graph() -> StateGraph:
             "skill_switch": "skill_switch",
             "recovery": "recovery",
             "pause": "pause",
+            "resume": "resume",
             "skip": "skip",
             "question_delivery": "question_delivery",
             "route_after_q3": "route_after_q3",
+            "termination": "termination",
             "conclusion": "conclusion",
             "voluntary_termination": "voluntary_termination",
             END: END,
         },
     )
+    graph.add_edge("follow_up", END)
 
     # 5. Pause -> Resume Sub-Flow
     graph.add_conditional_edges(
@@ -275,10 +266,15 @@ def create_interview_graph() -> StateGraph:
     )
     graph.add_conditional_edges(
         "voluntary_termination",
-        _stop_if_responded("conclusion"),
-        {"conclusion": "conclusion", END: END},
+        _stop_if_responded("finalization"),
+        {"finalization": "finalization", END: END},
     )
-    graph.add_edge("conclusion", END)
+    graph.add_conditional_edges(
+        "conclusion",
+        _stop_if_responded("finalization"),
+        {"finalization": "finalization", END: END},
+    )
+    graph.add_edge("finalization", END)
 
     # 8. In-Turn Helpers
     graph.add_edge("repeat", END)
@@ -375,6 +371,7 @@ class InterviewEngine:
             enforced = guardrails.enforce_output_length(response)
             session.last_agent_utterance = enforced
             session.greeting_completed = True
+            session.record_turn("VANI", enforced)
             return enforced
 
     async def handle_preparation_timeout(self, session_id: str) -> str:
@@ -453,6 +450,8 @@ class InterviewEngine:
                 session.last_agent_utterance = injection_msg
                 return injection_msg
 
+            session.record_turn("CANDIDATE", clean_input)
+
             state_input: InterviewState = {
                 "session_id": session_id,
                 "candidate_utterance": clean_input,
@@ -490,6 +489,10 @@ class InterviewEngine:
                 "clarification_count": session.clarification_count,
                 "session_status": session.session_status,
                 "termination_reason": session.termination_reason,
+                "stage_1_route": None,
+                "stage_2_route": None,
+                "ack_text": None,
+                "follow_up_text": None,
             }
 
             config = {"configurable": {"thread_id": session_id}}
@@ -508,7 +511,10 @@ class InterviewEngine:
 
             enforced = guardrails.enforce_output_length(response)
             session.last_agent_utterance = enforced
+            session.record_turn("VANI", enforced)
             if session.is_terminated():
+                from vani.session.persistence import persist_session_evaluation
+                await asyncio.to_thread(persist_session_evaluation, session)
                 self.cleanup_session_thread(session_id)
             return enforced
 

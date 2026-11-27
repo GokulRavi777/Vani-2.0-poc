@@ -14,6 +14,7 @@ class InterviewState(TypedDict, total=False):
     current_expected_concepts: List[str]
     primary_question_count: int
     max_primary_questions: int
+    remaining_questions: int
     follow_up_count_for_current_question: int
     max_follow_ups_per_question: int
     
@@ -28,6 +29,10 @@ class InterviewState(TypedDict, total=False):
     current_state: str
     previous_state: Optional[str]
     current_intent: str
+    stage_1_route: Optional[str]
+    stage_2_route: Optional[str]
+    ack_text: Optional[str]
+    follow_up_text: Optional[str]
     is_paused: bool
     is_completed: bool
     rolling_summary: str
